@@ -1,0 +1,52 @@
+{
+  "name": "n8n-nodes-remove-ac",
+  "version": "1.0.0",
+  "description": "Official zero-dependency n8n community node for remove.ac (/v1.0/removebg drop-in background removal + up to 25 MB zero-disk GPU streaming).",
+  "keywords": [
+    "n8n-community-node-package",
+    "remove.ac",
+    "remove.bg",
+    "background-removal",
+    "image-segmentation",
+    "cutout",
+    "ecommerce"
+  ],
+  "license": "MIT",
+  "homepage": "https://remove.ac/plugins",
+  "author": {
+    "name": "remove.ac",
+    "url": "https://remove.ac"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/szp2005/n8n-nodes-remove-ac.git"
+  },
+  "bugs": {
+    "url": "https://github.com/szp2005/n8n-nodes-remove-ac/issues"
+  },
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/n8n-node.test.mjs"
+  },
+  "files": [
+    "dist",
+    "index.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/RemoveAcApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/RemoveAc/RemoveAc.node.js"
+    ]
+  },
+  "engines": {
+    "node": ">=18.10.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}
