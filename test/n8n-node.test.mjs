@@ -4,7 +4,11 @@ import test from "node:test";
 
 const require = createRequire(import.meta.url);
 const { RemoveAcApi } = require("../dist/credentials/RemoveAcApi.credentials.js");
-const { RemoveAc, validatePublicUrl } = require("../dist/nodes/RemoveAc/RemoveAc.node.js");
+const {
+  RemoveAc,
+  parseImageDimensions,
+  validatePublicUrl,
+} = require("../dist/nodes/RemoveAc/RemoveAc.node.js");
 
 const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
@@ -59,11 +63,29 @@ function createMockExecuteContext({
   };
 }
 
-test("RemoveAcApi credential exposes X-Api-Key header and /v1.0/account test check", () => {
+test("RemoveAcApi credential exposes X-Api-Key header and HTTPS-only no-redirect /v1.0/account test check", () => {
   const cred = new RemoveAcApi();
   assert.equal(cred.name, "removeAcApi");
   assert.equal(cred.authenticate.properties.headers["X-Api-Key"], "={{$credentials.apiKey}}");
   assert.equal(cred.test.request.url, "/v1.0/account");
+  assert.equal(cred.test.request.disableFollowRedirect, true);
+  assert.equal(cred.test.request.sendCredentialsOnCrossOriginRedirect, false);
+
+  // Evaluate the credential test.request.baseURL expression against valid & malicious baseUrl inputs
+  const expr = cred.test.request.baseURL.replace(/^=\{\{|\}\}$/g, "").trim();
+  const evalBaseUrl = (baseUrl) =>
+    new Function("$credentials", `return (${expr});`)({ baseUrl });
+
+  assert.equal(evalBaseUrl("https://remove.ac"), "https://remove.ac");
+  assert.equal(evalBaseUrl("https://remove.ac/"), "https://remove.ac");
+  assert.equal(evalBaseUrl(""), "https://remove.ac");
+  assert.equal(evalBaseUrl("http://remove.ac"), "invalid://https-public-domain-required");
+  assert.equal(evalBaseUrl("http://169.254.169.254"), "invalid://https-public-domain-required");
+  assert.equal(evalBaseUrl("https://127.0.0.1:8080"), "invalid://https-public-domain-required");
+  assert.equal(evalBaseUrl("https://[::ffff:169.254.169.254]"), "invalid://https-public-domain-required");
+  assert.equal(evalBaseUrl("https://localhost:3000"), "invalid://https-public-domain-required");
+  assert.equal(evalBaseUrl("https://metadata.internal"), "invalid://https-public-domain-required");
+  assert.equal(evalBaseUrl("https://user:pass@remove.ac"), "invalid://https-public-domain-required");
 });
 
 test("RemoveAc node removes background from binary input and outputs binary + foreground metadata", async () => {
@@ -212,15 +234,106 @@ test("RemoveAc node blocks SSRF on imageUrl, baseUrl, and directEndpoint, and ha
   const [failOut] = await node.execute.call(failCtx);
   assert.match(failOut[0].json.error, /Private, loopback/);
 
-  // getAccount preserves 0 credit balance accurately
+  // getAccount preserves 0 credit balance accurately and disables redirect following
   const acctCtx = createMockExecuteContext({
     items: [{ json: {} }],
     params: { operation: "getAccount" },
     httpRequest: async (opts) => {
       assert.equal(opts.url, "http://127.0.0.1:8787/v1.0/account");
-      return { data: { attributes: { credits: { total: 0 } } } };
+      assert.equal(opts.disableFollowRedirect, true);
+      assert.equal(opts.sendCredentialsOnCrossOriginRedirect, false);
+      return {
+        statusCode: 200,
+        headers: { "content-type": "application/json" },
+        body: { data: { attributes: { credits: { total: 0 } } } },
+      };
     },
   });
   const [acctOut] = await node.execute.call(acctCtx);
   assert.equal(acctOut[0].json.totalCredits, 0);
+});
+
+test("MF-1 & MF-4: RemoveAc node rejects 3xx redirects across all endpoints, syncs gateway options (no 3d), and parses GIF/WebP headers", async () => {
+  const node = new RemoveAc();
+
+  // Verify Size, Foreground Type, and Shadow Type options match production remove.ac gateway
+  const sizeProp = node.description.properties.find((p) => p.name === "size");
+  const sizeVals = sizeProp.options.map((o) => o.value);
+  assert.ok(sizeVals.includes("regular") && sizeVals.includes("small"));
+
+  const addProps = node.description.properties.find((p) => p.name === "additionalOptions").options;
+  const fgTypeVals = addProps.find((p) => p.name === "type").options.map((o) => o.value);
+  assert.ok(fgTypeVals.includes("transportation"));
+
+  const shadowVals = addProps.find((p) => p.name === "shadowType").options.map((o) => o.value);
+  assert.equal(shadowVals.includes("3d"), false);
+  assert.deepEqual(
+    new Set(shadowVals),
+    new Set(["auto", "car", "drop", "soft", "contact", "reflection", "none"])
+  );
+
+  // Verify GIF and VP8X WebP dimension parsing
+  const gifHeader = Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x20, 0x03, 0x58, 0x02]);
+  assert.deepEqual(parseImageDimensions(gifHeader), { width: 800, height: 600 });
+
+  const webpVp8x = Buffer.alloc(30);
+  webpVp8x.write("RIFF", 0, "ascii");
+  webpVp8x.write("WEBP", 8, "ascii");
+  webpVp8x.write("VP8X", 12, "ascii");
+  // width - 1 = 3999 (0x000f9f), height - 1 = 2999 (0x000bb7)
+  webpVp8x[24] = 0x9f;
+  webpVp8x[25] = 0x0f;
+  webpVp8x[26] = 0x00;
+  webpVp8x[27] = 0xb7;
+  webpVp8x[28] = 0x0b;
+  webpVp8x[29] = 0x00;
+  assert.deepEqual(parseImageDimensions(webpVp8x), { width: 4000, height: 3000 });
+
+  // Verify 307 redirect responses fail closed with disableFollowRedirect: true on both /v1.0/removebg and /v1.0/removebg/ticket
+  let removebgCalls = 0;
+  const redirRemoveBgCtx = createMockExecuteContext({
+    items: [{ json: {}, binary: { data: { fileName: "a.png", mimeType: "image/png" } } }],
+    binaryBuffers: { data: TINY_PNG },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async (opts) => {
+      removebgCalls += 1;
+      assert.equal(opts.disableFollowRedirect, true);
+      assert.equal(opts.sendCredentialsOnCrossOriginRedirect, false);
+      return { statusCode: 307, headers: { location: "http://169.254.169.254/" }, body: Buffer.from("") };
+    },
+  });
+  await assert.rejects(() => node.execute.call(redirRemoveBgCtx), /\[HTTP 307\]/);
+  assert.equal(removebgCalls, 1);
+
+  let ticketCalls = 0;
+  const redirTicketCtx = createMockExecuteContext({
+    items: [{ json: {}, binary: { data: { fileName: "big.webp", mimeType: "image/webp" } } }],
+    binaryBuffers: { data: webpVp8x }, // 12 MP (>5 MP) triggers upfront ticket preflight!
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async (opts) => {
+      ticketCalls += 1;
+      assert.equal(opts.url, "http://127.0.0.1:8787/v1.0/removebg/ticket");
+      assert.equal(opts.disableFollowRedirect, true);
+      assert.equal(opts.sendCredentialsOnCrossOriginRedirect, false);
+      return { statusCode: 302, headers: { location: "http://evil.example/" }, body: "" };
+    },
+  });
+  await assert.rejects(() => node.execute.call(redirTicketCtx), /\[HTTP 302\]/);
+  assert.equal(ticketCalls, 1);
 });

@@ -40,9 +40,12 @@ class RemoveAcApi {
     };
     this.test = {
       request: {
-        baseURL: "={{$credentials.baseUrl || 'https://remove.ac'}}",
+        baseURL:
+          "={{ /^https:\\/\\/[a-z0-9-]+(\\.[a-z0-9-]+)+(:[0-9]{1,5})?\\/?$/i.test(($credentials.baseUrl || 'https://remove.ac').trim()) && !/\\.(localhost|local|internal|home\\.arpa)(:[0-9]+)?\\/?$/i.test(($credentials.baseUrl || '').trim()) && !/^https:\\/\\/[0-9.]+(:[0-9]+)?\\/?$/i.test(($credentials.baseUrl || '').trim()) ? ($credentials.baseUrl || 'https://remove.ac').trim().replace(/\\/+$/, '') : 'invalid://https-public-domain-required' }}",
         url: "/v1.0/account",
         method: "GET",
+        disableFollowRedirect: true,
+        sendCredentialsOnCrossOriginRedirect: false,
       },
     };
   }

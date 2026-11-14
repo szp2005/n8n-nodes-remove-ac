@@ -172,9 +172,14 @@ async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.
   if (list.length === 0) {
     throw new Error(`Hostname '${host}' returned no DNS records`);
   }
+  const allowTunFakeIp =
+    parsed.protocol === "https:" && (host === "remove.ac" || host.endsWith(".remove.ac"));
   for (const rec of list) {
     const addr = String(rec && rec.address ? rec.address : "").trim();
     if (net.isIPv4(addr)) {
+      const octs = addr.split(".").map((s) => Number.parseInt(s, 10));
+      const isRfc2544 = octs.length === 4 && octs[0] === 198 && (octs[1] === 18 || octs[1] === 19);
+      if (allowTunFakeIp && isRfc2544) continue;
       if (isPrivateIpv4(addr)) throw new Error(`Hostname '${host}' resolved to a private IPv4 address`);
     } else if (addr.includes(":")) {
       if (isPrivateIpv6(addr)) throw new Error(`Hostname '${host}' resolved to a private IPv6 address`);
@@ -197,6 +202,10 @@ function parseImageDimensions(input) {
     bytes[1] === 0x50 &&
     bytes[2] === 0x4e &&
     bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a &&
     bytes[12] === 0x49 &&
     bytes[13] === 0x48 &&
     bytes[14] === 0x44 &&
@@ -205,6 +214,51 @@ function parseImageDimensions(input) {
     const width = view.getUint32(16, false);
     const height = view.getUint32(20, false);
     return width > 0 && height > 0 && width <= 1_000_000 && height <= 1_000_000 ? { width, height } : null;
+  }
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+    const width = view.getUint16(6, true);
+    const height = view.getUint16(8, true);
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  if (
+    bytes.byteLength >= 25 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    if (
+      bytes.byteLength >= 30 &&
+      bytes[12] === 0x56 &&
+      bytes[13] === 0x50 &&
+      bytes[14] === 0x38 &&
+      bytes[15] === 0x20 &&
+      bytes[23] === 0x9d &&
+      bytes[24] === 0x01 &&
+      bytes[25] === 0x2a
+    ) {
+      const width = view.getUint16(26, true) & 0x3fff;
+      const height = view.getUint16(28, true) & 0x3fff;
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    if (bytes[12] === 0x56 && bytes[13] === 0x50 && bytes[14] === 0x38 && bytes[15] === 0x4c && bytes[20] === 0x2f) {
+      const b0 = bytes[21],
+        b1 = bytes[22],
+        b2 = bytes[23],
+        b3 = bytes[24];
+      const width = 1 + (b0 | ((b1 & 0x3f) << 8));
+      const height = 1 + ((b1 >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10));
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    if (bytes.byteLength >= 30 && bytes[12] === 0x56 && bytes[13] === 0x50 && bytes[14] === 0x38 && bytes[15] === 0x58) {
+      const width = 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16));
+      const height = 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16));
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
   }
   if (bytes[0] === 0xff && bytes[1] === 0xd8) {
     let pos = 2;
@@ -433,6 +487,8 @@ class RemoveAc {
             { name: "4K (Up to 10 MP)", value: "4k" },
             { name: "HD (Up to 4 MP)", value: "hd" },
             { name: "Medium (Up to 1.5 MP)", value: "medium" },
+            { name: "Regular (Up to 0.25 MP)", value: "regular" },
+            { name: "Small (Up to 0.25 MP)", value: "small" },
             { name: "Preview (Up to 0.25 MP)", value: "preview" },
           ],
           default: "full",
@@ -491,6 +547,7 @@ class RemoveAc {
                 { name: "Car", value: "car" },
                 { name: "Animal", value: "animal" },
                 { name: "Graphic", value: "graphic" },
+                { name: "Transportation", value: "transportation" },
               ],
               default: "auto",
             },
@@ -508,8 +565,10 @@ class RemoveAc {
                 { name: "Auto", value: "auto" },
                 { name: "Contact", value: "contact" },
                 { name: "Drop", value: "drop" },
+                { name: "Soft", value: "soft" },
                 { name: "Car", value: "car" },
-                { name: "3D", value: "3d" },
+                { name: "Reflection", value: "reflection" },
+                { name: "None", value: "none" },
               ],
               default: "auto",
             },
@@ -566,8 +625,27 @@ class RemoveAc {
               Accept: "application/json",
             },
             json: true,
+            disableFollowRedirect: true,
+            sendCredentialsOnCrossOriginRedirect: false,
+            returnFullResponse: true,
+            ignoreHttpStatusErrors: true,
           });
-          const bodyObj = typeof acctResp === "string" ? JSON.parse(acctResp) : acctResp;
+          const acctStatus =
+            acctResp && typeof acctResp.statusCode === "number" ? acctResp.statusCode : 200;
+          const acctRawBody =
+            acctResp && typeof acctResp === "object" && "statusCode" in acctResp
+              ? acctResp.body
+              : acctResp;
+          if (acctStatus < 200 || acctStatus >= 300) {
+            const errTxt =
+              typeof acctRawBody === "string"
+                ? acctRawBody
+                : Buffer.isBuffer(acctRawBody)
+                  ? acctRawBody.toString("utf8")
+                  : JSON.stringify(acctRawBody ?? "");
+            throw new Error(`[HTTP ${acctStatus}] ${errTxt}`);
+          }
+          const bodyObj = typeof acctRawBody === "string" ? JSON.parse(acctRawBody) : acctRawBody;
           const totalCredits = extractTotalCredits(bodyObj);
           returnData.push({
             json: {
@@ -653,8 +731,27 @@ class RemoveAc {
             },
             body: ticketPayload,
             json: true,
+            disableFollowRedirect: true,
+            sendCredentialsOnCrossOriginRedirect: false,
+            returnFullResponse: true,
+            ignoreHttpStatusErrors: true,
           });
-          const tJson = typeof ticketRes === "string" ? JSON.parse(ticketRes) : ticketRes;
+          const ticketStatus =
+            ticketRes && typeof ticketRes.statusCode === "number" ? ticketRes.statusCode : 200;
+          const ticketRawBody =
+            ticketRes && typeof ticketRes === "object" && "statusCode" in ticketRes
+              ? ticketRes.body
+              : ticketRes;
+          if (ticketStatus < 200 || ticketStatus >= 300) {
+            const errTxt =
+              typeof ticketRawBody === "string"
+                ? ticketRawBody
+                : Buffer.isBuffer(ticketRawBody)
+                  ? ticketRawBody.toString("utf8")
+                  : JSON.stringify(ticketRawBody ?? "");
+            throw new Error(`[HTTP ${ticketStatus}] ${errTxt}`);
+          }
+          const tJson = typeof ticketRawBody === "string" ? JSON.parse(ticketRawBody) : ticketRawBody;
           if (!tJson || !tJson.data || !tJson.data.directEndpoint || !tJson.data.ticket) {
             throw new Error("Invalid /v1.0/removebg/ticket response from remove.ac");
           }
@@ -684,6 +781,8 @@ class RemoveAc {
             body: mp.body,
             encoding: "arraybuffer",
             json: false,
+            disableFollowRedirect: true,
+            sendCredentialsOnCrossOriginRedirect: false,
             returnFullResponse: true,
             ignoreHttpStatusErrors: true,
           });
@@ -724,6 +823,8 @@ class RemoveAc {
             body: mp.body,
             encoding: "arraybuffer",
             json: false,
+            disableFollowRedirect: true,
+            sendCredentialsOnCrossOriginRedirect: false,
             returnFullResponse: true,
             ignoreHttpStatusErrors: true,
           });
