@@ -297,6 +297,8 @@ function shouldPreFlightViaTicket(bytes, size, format, channels, crop) {
   else if (size === "medium") effectivePixels = Math.min(inputPixels, 1_500_000);
   else if (size === "hd") effectivePixels = Math.min(inputPixels, 4_000_000);
   else if (size === "4k") effectivePixels = Math.min(inputPixels, 10_000_000);
+  else if (size === "25mp") effectivePixels = Math.min(inputPixels, 25_000_000);
+  else effectivePixels = Math.min(inputPixels, 50_000_000);
   return effectivePixels > (crop ? DIRECT_CROPPED_RGBA_PNG_PIXELS : DIRECT_RGBA_PNG_PIXELS);
 }
 
@@ -310,20 +312,24 @@ function deriveSubIdempotencyKey(idem, suffix) {
   return `${trimmed.slice(0, 180)}:${hash}:${suffix}`;
 }
 
-function buildMultipartFormData(fields, filePart) {
+function buildMultipartFormData(fields, filePart, extraFileParts = []) {
   const boundary = `----RemoveAcN8n${crypto.randomBytes(16).toString("hex")}`;
   const chunks = [];
+  const allFileParts = [filePart, ...(Array.isArray(extraFileParts) ? extraFileParts : [])].filter(
+    Boolean
+  );
 
-  if (filePart) {
-    const safeName = String(filePart.fileName || "image.png").replace(/[\r\n"\\]/g, "_");
-    const safeMime = String(filePart.mimeType || "application/octet-stream").replace(/[\r\n]/g, "");
+  for (const part of allFileParts) {
+    const safeField = String(part.fieldName || "image_file").replace(/[\r\n"\\]/g, "_");
+    const safeName = String(part.fileName || "image.png").replace(/[\r\n"\\]/g, "_");
+    const safeMime = String(part.mimeType || "application/octet-stream").replace(/[\r\n]/g, "");
     chunks.push(
       Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="${filePart.fieldName}"; filename="${safeName}"\r\nContent-Type: ${safeMime}\r\n\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="${safeField}"; filename="${safeName}"\r\nContent-Type: ${safeMime}\r\n\r\n`,
         "utf8"
       )
     );
-    chunks.push(Buffer.from(filePart.buffer));
+    chunks.push(Buffer.from(part.buffer));
     chunks.push(Buffer.from("\r\n", "utf8"));
   }
 
@@ -374,7 +380,7 @@ class RemoveAc {
       version: 1,
       subtitle: '={{$parameter["operation"]}}',
       description:
-        "Remove image backgrounds via remove.ac (/v1.0/removebg drop-in API + up to 25 MB zero-disk GPU streaming).",
+        "Remove image backgrounds via remove.ac (/v1.0/removebg drop-in API + up to 25 MB / 50 MP zero-disk GPU streaming).",
       defaults: {
         name: "remove.ac",
       },
@@ -482,8 +488,10 @@ class RemoveAc {
             },
           },
           options: [
-            { name: "Full (Up to 25 MB / 40 MP)", value: "full" },
-            { name: "Auto", value: "auto" },
+            { name: "Full (Up to 25 MB / 50 MP)", value: "full" },
+            { name: "Auto (Up to 50 MP)", value: "auto" },
+            { name: "50 MP (Up to 50 MP)", value: "50mp" },
+            { name: "25 MP (Up to 25 MP)", value: "25mp" },
             { name: "4K (Up to 10 MP)", value: "4k" },
             { name: "HD (Up to 4 MP)", value: "hd" },
             { name: "Medium (Up to 1.5 MP)", value: "medium" },
@@ -529,6 +537,24 @@ class RemoveAc {
               default: "",
               placeholder: "FFFFFF",
               description: "Solid hex background color (e.g. FFFFFF for marketplace white).",
+            },
+            {
+              displayName: "Background Image Binary Field",
+              name: "bgImageBinaryProperty",
+              type: "string",
+              default: "",
+              placeholder: "bgData",
+              description:
+                "Optional name of an upstream binary property containing a custom background image (up to 25 MB / 50 MP, uploaded as bg_image_file).",
+            },
+            {
+              displayName: "Background Image URL",
+              name: "bgImageUrl",
+              type: "string",
+              default: "",
+              placeholder: "https://example.com/studio-backdrop.jpg",
+              description:
+                "Optional public HTTP/HTTPS URL of a custom background image to composite behind the subject (sent as bg_image_url).",
             },
             {
               displayName: "Crop Transparent Padding",
@@ -666,6 +692,43 @@ class RemoveAc {
         const crop = Boolean(additional.crop);
         const idem = `n8n-${crypto.randomUUID()}`;
 
+        const rawBgColor = String(additional.bgColor || "").trim().replace(/^#/, "");
+        const rawBgBinaryProp = String(additional.bgImageBinaryProperty || "").trim();
+        const rawBgUrl = String(additional.bgImageUrl || "").trim();
+        const bgSourceCount =
+          (rawBgColor ? 1 : 0) + (rawBgBinaryProp ? 1 : 0) + (rawBgUrl ? 1 : 0);
+        if (bgSourceCount > 1) {
+          throw new Error(
+            "Specify at most one of Background Color, Background Image Binary Field, or Background Image URL."
+          );
+        }
+
+        let bgBytes = null;
+        let bgFileName = "bg-image.png";
+        let bgMimeType = "application/octet-stream";
+        let bgUrl = null;
+
+        if (rawBgBinaryProp) {
+          const bgMeta = this.helpers.assertBinaryData(i, rawBgBinaryProp);
+          bgBytes = Buffer.from(await this.helpers.getBinaryDataBuffer(i, rawBgBinaryProp));
+          if (bgBytes.byteLength === 0) {
+            throw new Error(`Background binary property '${rawBgBinaryProp}' is empty.`);
+          }
+          if (bgBytes.byteLength > MAX_UPLOAD_BYTES) {
+            throw new Error(
+              `Background image exceeds remove.ac 25 MB limit (${bgBytes.byteLength} bytes).`
+            );
+          }
+          bgFileName = bgMeta.fileName || "bg-image.png";
+          bgMimeType = bgMeta.mimeType || "application/octet-stream";
+        } else if (rawBgUrl) {
+          const validatedBg = await validatePublicUrl(rawBgUrl, {
+            requireHttps: false,
+            lookupFn,
+          });
+          bgUrl = validatedBg.toString();
+        }
+
         let sourceBytes = null;
         let sourceFileName = "image.png";
         let sourceMimeType = "image/png";
@@ -696,12 +759,24 @@ class RemoveAc {
           sourceFileName = urlPath;
         }
 
+        const bgFilePart = bgBytes
+          ? [
+              {
+                fieldName: "bg_image_file",
+                fileName: bgFileName,
+                mimeType: bgMimeType,
+                buffer: bgBytes,
+              },
+            ]
+          : [];
+
         const optionFields = {
           size,
           format,
           channels,
           ...(additional.type && additional.type !== "auto" ? { type: additional.type } : {}),
-          ...(additional.bgColor ? { bg_color: String(additional.bgColor).replace(/^#/, "") } : {}),
+          ...(rawBgColor ? { bg_color: rawBgColor } : {}),
+          ...(bgUrl ? { bg_image_url: bgUrl } : {}),
           ...(additional.crop !== undefined ? { crop: String(Boolean(additional.crop)) } : {}),
           ...(additional.addShadow !== undefined ? { add_shadow: String(Boolean(additional.addShadow)) } : {}),
           ...(additional.shadowType && additional.addShadow ? { shadow_type: additional.shadowType } : {}),
@@ -715,7 +790,14 @@ class RemoveAc {
             format,
             channels,
             ...(additional.type && additional.type !== "auto" ? { type: additional.type } : {}),
-            ...(additional.bgColor ? { bg_color: String(additional.bgColor).replace(/^#/, "") } : {}),
+            ...(rawBgColor ? { bg_color: rawBgColor } : {}),
+            ...(bgUrl ? { bg_image_url: bgUrl } : {}),
+            ...(bgBytes
+              ? {
+                  bgImageSha256: sha256Hex(bgBytes),
+                  bgImageByteLength: bgBytes.byteLength,
+                }
+              : {}),
             ...(additional.crop !== undefined ? { crop: Boolean(additional.crop) } : {}),
             ...(additional.addShadow !== undefined ? { add_shadow: Boolean(additional.addShadow) } : {}),
             ...(additional.shadowType && additional.addShadow ? { shadow_type: additional.shadowType } : {}),
@@ -764,12 +846,16 @@ class RemoveAc {
             });
           }
 
-          const mp = buildMultipartFormData({}, {
-            fieldName: "image_file",
-            fileName: sourceFileName,
-            mimeType: sourceMimeType,
-            buffer: sourceBytes,
-          });
+          const mp = buildMultipartFormData(
+            {},
+            {
+              fieldName: "image_file",
+              fileName: sourceFileName,
+              mimeType: sourceMimeType,
+              buffer: sourceBytes,
+            },
+            bgFilePart
+          );
 
           const dRes = await this.helpers.httpRequest({
             method: "POST",
@@ -798,19 +884,25 @@ class RemoveAc {
         const needsTicketUpfront =
           sourceBytes &&
           (sourceBytes.byteLength > DIRECT_THRESHOLD_BYTES ||
+            (bgBytes && bgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
+            (bgBytes && sourceBytes.byteLength + bgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
             shouldPreFlightViaTicket(sourceBytes, size, format, channels, crop));
 
         if (needsTicketUpfront) {
           rawResponse = await runTicketStream("direct");
         } else {
           const mp = sourceUrl
-            ? buildMultipartFormData({ ...optionFields, image_url: sourceUrl }, null)
-            : buildMultipartFormData(optionFields, {
-                fieldName: "image_file",
-                fileName: sourceFileName,
-                mimeType: sourceMimeType,
-                buffer: sourceBytes,
-              });
+            ? buildMultipartFormData({ ...optionFields, image_url: sourceUrl }, null, bgFilePart)
+            : buildMultipartFormData(
+                optionFields,
+                {
+                  fieldName: "image_file",
+                  fileName: sourceFileName,
+                  mimeType: sourceMimeType,
+                  buffer: sourceBytes,
+                },
+                bgFilePart
+              );
 
           const directRes = await this.helpers.httpRequest({
             method: "POST",

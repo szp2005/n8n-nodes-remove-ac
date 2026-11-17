@@ -337,3 +337,142 @@ test("MF-1 & MF-4: RemoveAc node rejects 3xx redirects across all endpoints, syn
   await assert.rejects(() => node.execute.call(redirTicketCtx), /\[HTTP 302\]/);
   assert.equal(ticketCalls, 1);
 });
+
+test("v1.0.1 exposes 25mp & 50mp tiers, 10 welcome credits copy, and bgImageBinaryProperty / bgImageUrl on sync & ticket streams", async () => {
+  const crypto = await import("node:crypto");
+  const cred = new RemoveAcApi();
+  const apiKeyProp = cred.properties.find((p) => p.name === "apiKey");
+  assert.match(apiKeyProp.description, /10 full-resolution welcome credits \(valid 30 days\)/);
+
+  const node = new RemoveAc();
+  assert.match(node.description.description, /50 MP/);
+  const sizeProp = node.description.properties.find((p) => p.name === "size");
+  const sizeVals = sizeProp.options.map((o) => o.value);
+  assert.ok(sizeVals.includes("25mp") && sizeVals.includes("50mp"));
+  assert.match(sizeProp.options.find((o) => o.value === "full").name, /50 MP/);
+
+  // 1. Sync /v1.0/removebg encodes both image_file and bg_image_file from bgImageBinaryProperty
+  let syncBodyStr = "";
+  const syncBgCtx = createMockExecuteContext({
+    items: [
+      {
+        json: { id: "bg-sync" },
+        binary: {
+          data: { fileName: "product.png", mimeType: "image/png" },
+          backdrop: { fileName: "marble.jpg", mimeType: "image/jpeg" },
+        },
+      },
+    ],
+    binaryBuffers: {
+      data: TINY_PNG,
+      backdrop: Buffer.from("MARBLE_JPEG_BYTES"),
+    },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "cutout",
+      size: "50mp",
+      format: "png",
+      additionalOptions: { bgImageBinaryProperty: "backdrop" },
+    },
+    httpRequest: async (opts) => {
+      assert.equal(opts.url, "http://127.0.0.1:8787/v1.0/removebg");
+      syncBodyStr = opts.body.toString("utf8");
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/png", "x-credits-charged": "1" },
+        body: TINY_PNG,
+      };
+    },
+  });
+  const [syncOut] = await node.execute.call(syncBgCtx);
+  assert.equal(syncOut[0].binary.cutout.fileName, "product-nobg.png");
+  assert.match(syncBodyStr, /name="image_file"; filename="product\.png"/);
+  assert.match(syncBodyStr, /name="bg_image_file"; filename="marble\.jpg"/);
+  assert.match(syncBodyStr, /MARBLE_JPEG_BYTES/);
+  assert.match(syncBodyStr, /name="size"\r\n\r\n50mp/);
+
+  // 2. Combined >4 MB (2.5 MB fg + 2.5 MB bg) upgrades to /v1.0/removebg/ticket with bgImageSha256 & uploads bg_image_file
+  const fg25 = Buffer.alloc(Math.floor(2.5 * 1024 * 1024), 0x31);
+  const bg25 = Buffer.alloc(Math.floor(2.5 * 1024 * 1024), 0x32);
+  let seenTicketPayload = null;
+  let seenDirectBody = null;
+
+  const ticketBgCtx = createMockExecuteContext({
+    items: [
+      {
+        json: {},
+        binary: {
+          data: { fileName: "fg.png", mimeType: "image/png" },
+          bgData: { fileName: "bg.png", mimeType: "image/png" },
+        },
+      },
+    ],
+    binaryBuffers: { data: fg25, bgData: bg25 },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "25mp",
+      format: "png",
+      additionalOptions: { bgImageBinaryProperty: "bgData" },
+    },
+    httpRequest: async (opts) => {
+      if (opts.url.endsWith("/v1.0/removebg/ticket")) {
+        seenTicketPayload = opts.body;
+        return {
+          data: {
+            directEndpoint: "http://127.0.0.1:9999/v1.0/direct-cutout",
+            ticket: "hmac_bg_tkt",
+          },
+        };
+      }
+      seenDirectBody = opts.body;
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/png", "x-credits-charged": "1" },
+        body: TINY_PNG,
+      };
+    },
+  });
+  await node.execute.call(ticketBgCtx);
+  assert.equal(seenTicketPayload.size, "25mp");
+  assert.equal(seenTicketPayload.bgImageSha256, crypto.createHash("sha256").update(bg25).digest("hex"));
+  assert.equal(seenTicketPayload.bgImageByteLength, bg25.byteLength);
+  assert.ok(seenDirectBody.includes(Buffer.from('name="image_file"; filename="fg.png"')));
+  assert.ok(seenDirectBody.includes(Buffer.from('name="bg_image_file"; filename="bg.png"')));
+
+  // 3. Rejects SSRF bgImageUrl and conflicting background options before touching network
+  for (const badAdditional of [
+    { bgColor: "FFFFFF", bgImageBinaryProperty: "bgData" },
+    { bgImageUrl: "http://169.254.169.254/latest/meta-data" },
+  ]) {
+    const badCtx = createMockExecuteContext({
+      items: [
+        {
+          json: {},
+          binary: {
+            data: { fileName: "fg.png", mimeType: "image/png" },
+            bgData: { fileName: "bg.png", mimeType: "image/png" },
+          },
+        },
+      ],
+      binaryBuffers: { data: TINY_PNG, bgData: TINY_PNG },
+      params: {
+        operation: "removeBackground",
+        inputSource: "binary",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        size: "full",
+        format: "png",
+        additionalOptions: badAdditional,
+      },
+      httpRequest: async () => {
+        throw new Error("should not reach network");
+      },
+    });
+    await assert.rejects(() => node.execute.call(badCtx));
+  }
+});
