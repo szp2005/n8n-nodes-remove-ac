@@ -1,6 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RemoveAc =
+  exports.normalizeShadowOptions =
+  exports.formatErrorBody =
+  exports.toNodeBuffer =
   exports.validatePublicUrl =
   exports.isPrivateIpv6 =
   exports.isPrivateIpv4 =
@@ -14,6 +17,11 @@ const net = require("node:net");
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_DIRECT_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_COMBINED_IMAGE_BYTES = MAX_DIRECT_BODY_BYTES - 65536;
+const MAX_IMAGE_PIXELS = 50_000_000;
+const MAX_IMAGE_SIDE = 50_000;
+const MAX_REMOTE_REDIRECTS = 3;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
 
@@ -312,6 +320,90 @@ function deriveSubIdempotencyKey(idem, suffix) {
   return `${trimmed.slice(0, 180)}:${hash}:${suffix}`;
 }
 
+function toNodeBuffer(val) {
+  if (Buffer.isBuffer(val)) return val;
+  if (val instanceof ArrayBuffer) return Buffer.from(val);
+  if (ArrayBuffer.isView(val)) {
+    return Buffer.from(val.buffer, val.byteOffset, val.byteLength);
+  }
+  if (typeof val === "string") return Buffer.from(val, "utf8");
+  return null;
+}
+exports.toNodeBuffer = toNodeBuffer;
+
+function formatErrorBody(rawBody) {
+  if (rawBody === undefined || rawBody === null) return "";
+  if (typeof rawBody === "string") return rawBody;
+  if (Buffer.isBuffer(rawBody)) return rawBody.toString("utf8");
+  if (rawBody instanceof ArrayBuffer) return Buffer.from(rawBody).toString("utf8");
+  if (ArrayBuffer.isView(rawBody)) {
+    return Buffer.from(rawBody.buffer, rawBody.byteOffset, rawBody.byteLength).toString("utf8");
+  }
+  try {
+    return JSON.stringify(rawBody);
+  } catch {
+    return String(rawBody);
+  }
+}
+exports.formatErrorBody = formatErrorBody;
+
+function validateAndParseImageDimensions(bytes, label) {
+  const dims = parseImageDimensions(bytes);
+  if (dims) {
+    const pixels = dims.width * dims.height;
+    if (pixels > MAX_IMAGE_PIXELS || dims.width > MAX_IMAGE_SIDE || dims.height > MAX_IMAGE_SIDE) {
+      const mp = (pixels / 1_000_000).toFixed(1);
+      throw new Error(
+        `${label} resolution ${dims.width}x${dims.height} (${mp} MP) exceeds remove.ac 50 MP / 50,000px maximum.`
+      );
+    }
+  }
+  return dims;
+}
+
+function assertCombinedMultipartWithinLimit(fgBytes, bgImgBytes) {
+  if (
+    fgBytes &&
+    bgImgBytes &&
+    fgBytes.byteLength + bgImgBytes.byteLength > MAX_COMBINED_IMAGE_BYTES
+  ) {
+    throw new Error(
+      `Combined foreground (${fgBytes.byteLength} bytes) and background (${bgImgBytes.byteLength} bytes) exceed remove.ac 32 MB direct upload stream limit.`
+    );
+  }
+}
+
+function normalizeShadowOptions(additional = {}) {
+  const rawShadowType =
+    typeof additional.shadowType === "string" ? additional.shadowType.trim().toLowerCase() : "";
+  if (rawShadowType === "none") {
+    return {
+      multipart: { add_shadow: "false", shadow_type: "none" },
+      json: { add_shadow: false, shadow_type: "none" },
+    };
+  }
+  if (additional.addShadow === false) {
+    return {
+      multipart: { add_shadow: "false" },
+      json: { add_shadow: false },
+    };
+  }
+  if (rawShadowType) {
+    return {
+      multipart: { add_shadow: "true", shadow_type: rawShadowType },
+      json: { add_shadow: true, shadow_type: rawShadowType },
+    };
+  }
+  if (additional.addShadow === true) {
+    return {
+      multipart: { add_shadow: "true" },
+      json: { add_shadow: true },
+    };
+  }
+  return { multipart: {}, json: {} };
+}
+exports.normalizeShadowOptions = normalizeShadowOptions;
+
 function buildMultipartFormData(fields, filePart, extraFileParts = []) {
   const boundary = `----RemoveAcN8n${crypto.randomBytes(16).toString("hex")}`;
   const chunks = [];
@@ -323,13 +415,17 @@ function buildMultipartFormData(fields, filePart, extraFileParts = []) {
     const safeField = String(part.fieldName || "image_file").replace(/[\r\n"\\]/g, "_");
     const safeName = String(part.fileName || "image.png").replace(/[\r\n"\\]/g, "_");
     const safeMime = String(part.mimeType || "application/octet-stream").replace(/[\r\n]/g, "");
+    const partBuf = toNodeBuffer(part.buffer);
+    if (!partBuf) {
+      throw new Error(`Invalid binary buffer for multipart field '${safeField}'.`);
+    }
     chunks.push(
       Buffer.from(
         `--${boundary}\r\nContent-Disposition: form-data; name="${safeField}"; filename="${safeName}"\r\nContent-Type: ${safeMime}\r\n\r\n`,
         "utf8"
       )
     );
-    chunks.push(Buffer.from(part.buffer));
+    chunks.push(partBuf);
     chunks.push(Buffer.from("\r\n", "utf8"));
   }
 
@@ -511,6 +607,7 @@ class RemoveAc {
             },
           },
           options: [
+            { name: "Auto", value: "auto" },
             { name: "PNG (Transparent)", value: "png" },
             { name: "WebP", value: "webp" },
             { name: "JPG", value: "jpg" },
@@ -663,13 +760,7 @@ class RemoveAc {
               ? acctResp.body
               : acctResp;
           if (acctStatus < 200 || acctStatus >= 300) {
-            const errTxt =
-              typeof acctRawBody === "string"
-                ? acctRawBody
-                : Buffer.isBuffer(acctRawBody)
-                  ? acctRawBody.toString("utf8")
-                  : JSON.stringify(acctRawBody ?? "");
-            throw new Error(`[HTTP ${acctStatus}] ${errTxt}`);
+            throw new Error(`[HTTP ${acctStatus}] ${formatErrorBody(acctRawBody)}`);
           }
           const bodyObj = typeof acctRawBody === "string" ? JSON.parse(acctRawBody) : acctRawBody;
           const totalCredits = extractTotalCredits(bodyObj);
@@ -707,11 +798,12 @@ class RemoveAc {
         let bgFileName = "bg-image.png";
         let bgMimeType = "application/octet-stream";
         let bgUrl = null;
+        let bgDims = null;
 
         if (rawBgBinaryProp) {
           const bgMeta = this.helpers.assertBinaryData(i, rawBgBinaryProp);
-          bgBytes = Buffer.from(await this.helpers.getBinaryDataBuffer(i, rawBgBinaryProp));
-          if (bgBytes.byteLength === 0) {
+          bgBytes = toNodeBuffer(await this.helpers.getBinaryDataBuffer(i, rawBgBinaryProp));
+          if (!bgBytes || bgBytes.byteLength === 0) {
             throw new Error(`Background binary property '${rawBgBinaryProp}' is empty.`);
           }
           if (bgBytes.byteLength > MAX_UPLOAD_BYTES) {
@@ -719,6 +811,7 @@ class RemoveAc {
               `Background image exceeds remove.ac 25 MB limit (${bgBytes.byteLength} bytes).`
             );
           }
+          bgDims = validateAndParseImageDimensions(bgBytes, "Background image");
           bgFileName = bgMeta.fileName || "bg-image.png";
           bgMimeType = bgMeta.mimeType || "application/octet-stream";
         } else if (rawBgUrl) {
@@ -733,12 +826,13 @@ class RemoveAc {
         let sourceFileName = "image.png";
         let sourceMimeType = "image/png";
         let sourceUrl = null;
+        let fgDims = null;
 
         if (inputSource === "binary") {
           const binaryPropertyName = this.getNodeParameter("binaryPropertyName", i);
           const binaryMeta = this.helpers.assertBinaryData(i, binaryPropertyName);
-          sourceBytes = Buffer.from(await this.helpers.getBinaryDataBuffer(i, binaryPropertyName));
-          if (sourceBytes.byteLength === 0) {
+          sourceBytes = toNodeBuffer(await this.helpers.getBinaryDataBuffer(i, binaryPropertyName));
+          if (!sourceBytes || sourceBytes.byteLength === 0) {
             throw new Error(`Input binary property '${binaryPropertyName}' is empty.`);
           }
           if (sourceBytes.byteLength > MAX_UPLOAD_BYTES) {
@@ -746,6 +840,8 @@ class RemoveAc {
               `Input image exceeds remove.ac 25 MB limit (${sourceBytes.byteLength} bytes).`
             );
           }
+          fgDims = validateAndParseImageDimensions(sourceBytes, "Input image");
+          assertCombinedMultipartWithinLimit(sourceBytes, bgBytes);
           sourceFileName = binaryMeta.fileName || "image.png";
           sourceMimeType = binaryMeta.mimeType || "application/octet-stream";
         } else {
@@ -759,6 +855,92 @@ class RemoveAc {
           sourceFileName = urlPath;
         }
 
+        const fetchRemoteImageBytes = async (initialUrl) => {
+          let currentUrl = initialUrl;
+          for (let hop = 0; hop <= MAX_REMOTE_REDIRECTS; hop++) {
+            const validated = await validatePublicUrl(currentUrl, {
+              requireHttps: false,
+              lookupFn,
+            });
+            currentUrl = validated.toString();
+
+            const imgRes = await this.helpers.httpRequest({
+              method: "GET",
+              url: currentUrl,
+              headers: {
+                Accept: "image/*,*/*;q=0.8",
+              },
+              encoding: "arraybuffer",
+              json: false,
+              disableFollowRedirect: true,
+              sendCredentialsOnCrossOriginRedirect: false,
+              returnFullResponse: true,
+              ignoreHttpStatusErrors: true,
+            });
+
+            const status =
+              imgRes && typeof imgRes.statusCode === "number" ? imgRes.statusCode : 200;
+            const rawBody =
+              imgRes && typeof imgRes === "object" && "statusCode" in imgRes
+                ? imgRes.body
+                : imgRes;
+            const respHeaders = (imgRes && imgRes.headers) || {};
+
+            if ([301, 302, 303, 307, 308].includes(status)) {
+              const location = readHeader(respHeaders, "location").trim();
+              if (!location) {
+                throw new Error(`Remote image redirect [HTTP ${status}] missing Location header.`);
+              }
+              if (hop === MAX_REMOTE_REDIRECTS) {
+                throw new Error(
+                  `Remote image URL exceeded maximum redirect limit (${MAX_REMOTE_REDIRECTS}).`
+                );
+              }
+              currentUrl = new URL(location, currentUrl).toString();
+              continue;
+            }
+
+            if (status < 200 || status >= 300) {
+              throw new Error(
+                `Failed to fetch remote image [HTTP ${status}]: ${formatErrorBody(rawBody)}`
+              );
+            }
+
+            const fetchedBuf = toNodeBuffer(rawBody);
+            if (!fetchedBuf || fetchedBuf.byteLength === 0) {
+              throw new Error("Remote image response body is empty.");
+            }
+            if (fetchedBuf.byteLength > MAX_UPLOAD_BYTES) {
+              throw new Error(
+                `Remote image exceeds remove.ac 25 MB limit (${fetchedBuf.byteLength} bytes).`
+              );
+            }
+            const dims = validateAndParseImageDimensions(fetchedBuf, "Remote input image");
+            const contentType = readHeader(respHeaders, "content-type").split(";")[0].trim();
+            return {
+              buffer: fetchedBuf,
+              mimeType: contentType || "application/octet-stream",
+              dims,
+            };
+          }
+          throw new Error(
+            `Remote image URL exceeded maximum redirect limit (${MAX_REMOTE_REDIRECTS}).`
+          );
+        };
+
+        const ensureSourceBytesForTicket = async () => {
+          if (!sourceBytes) {
+            if (!sourceUrl) {
+              throw new Error("Missing binary or URL input source for ticket stream.");
+            }
+            const fetched = await fetchRemoteImageBytes(sourceUrl);
+            sourceBytes = fetched.buffer;
+            sourceMimeType = fetched.mimeType;
+            fgDims = fetched.dims;
+          }
+          assertCombinedMultipartWithinLimit(sourceBytes, bgBytes);
+        };
+
         const bgFilePart = bgBytes
           ? [
               {
@@ -770,6 +952,8 @@ class RemoveAc {
             ]
           : [];
 
+        const shadowOpts = normalizeShadowOptions(additional);
+
         const optionFields = {
           size,
           format,
@@ -778,14 +962,32 @@ class RemoveAc {
           ...(rawBgColor ? { bg_color: rawBgColor } : {}),
           ...(bgUrl ? { bg_image_url: bgUrl } : {}),
           ...(additional.crop !== undefined ? { crop: String(Boolean(additional.crop)) } : {}),
-          ...(additional.addShadow !== undefined ? { add_shadow: String(Boolean(additional.addShadow)) } : {}),
-          ...(additional.shadowType && additional.addShadow ? { shadow_type: additional.shadowType } : {}),
+          ...shadowOpts.multipart,
         };
 
         const runTicketStream = async (suffix) => {
+          await ensureSourceBytesForTicket();
+
+          const mp = buildMultipartFormData(
+            {},
+            {
+              fieldName: "image_file",
+              fileName: sourceFileName,
+              mimeType: sourceMimeType,
+              buffer: sourceBytes,
+            },
+            bgFilePart
+          );
+          if (mp.body.byteLength > MAX_DIRECT_BODY_BYTES) {
+            throw new Error(
+              `Multipart direct upload payload (${mp.body.byteLength} bytes) exceeds remove.ac 32 MB stream limit.`
+            );
+          }
+
           const ticketPayload = {
             foregroundSha256: sha256Hex(sourceBytes),
             foregroundByteLength: sourceBytes.byteLength,
+            ...(fgDims ? { width: fgDims.width, height: fgDims.height } : {}),
             size,
             format,
             channels,
@@ -796,11 +998,11 @@ class RemoveAc {
               ? {
                   bgImageSha256: sha256Hex(bgBytes),
                   bgImageByteLength: bgBytes.byteLength,
+                  ...(bgDims ? { bgWidth: bgDims.width, bgHeight: bgDims.height } : {}),
                 }
               : {}),
             ...(additional.crop !== undefined ? { crop: Boolean(additional.crop) } : {}),
-            ...(additional.addShadow !== undefined ? { add_shadow: Boolean(additional.addShadow) } : {}),
-            ...(additional.shadowType && additional.addShadow ? { shadow_type: additional.shadowType } : {}),
+            ...shadowOpts.json,
           };
 
           const ticketRes = await this.helpers.httpRequest({
@@ -825,68 +1027,143 @@ class RemoveAc {
               ? ticketRes.body
               : ticketRes;
           if (ticketStatus < 200 || ticketStatus >= 300) {
-            const errTxt =
-              typeof ticketRawBody === "string"
-                ? ticketRawBody
-                : Buffer.isBuffer(ticketRawBody)
-                  ? ticketRawBody.toString("utf8")
-                  : JSON.stringify(ticketRawBody ?? "");
-            throw new Error(`[HTTP ${ticketStatus}] ${errTxt}`);
+            throw new Error(`[HTTP ${ticketStatus}] ${formatErrorBody(ticketRawBody)}`);
           }
           const tJson = typeof ticketRawBody === "string" ? JSON.parse(ticketRawBody) : ticketRawBody;
-          if (!tJson || !tJson.data || !tJson.data.directEndpoint || !tJson.data.ticket) {
+          const tData =
+            tJson && typeof tJson === "object" && tJson.data && typeof tJson.data === "object"
+              ? tJson.data
+              : tJson;
+
+          const holdId = String((tData && (tData.holdId ?? tData.lock_id)) || "").trim();
+          const releaseToken = String(
+            (tData && (tData.releaseToken ?? tData.release_token)) || ""
+          ).trim();
+          const rawReleaseEndpoint = String(
+            (tData && (tData.releaseEndpoint ?? tData.release_endpoint)) ||
+              `${baseUrl}/v1.0/removebg/ticket/release`
+          ).trim();
+
+          let holdReleased = false;
+          const releaseTicketHold = async () => {
+            if (holdReleased || !holdId || !releaseToken) return false;
+            holdReleased = true;
+            let safeReleaseUrl = `${baseUrl}/v1.0/removebg/ticket/release`;
+            try {
+              const parsedRel = new URL(rawReleaseEndpoint);
+              if (parsedRel.origin === baseUrl) {
+                if (!allowLoopback) {
+                  await validatePublicUrl(parsedRel.toString(), {
+                    requireHttps: true,
+                    lookupFn,
+                  });
+                }
+                safeReleaseUrl = parsedRel.toString();
+              } else if (!allowLoopback) {
+                await validatePublicUrl(`${baseUrl}/v1.0/removebg/ticket/release`, {
+                  requireHttps: true,
+                  lookupFn,
+                });
+              }
+            } catch {
+              safeReleaseUrl = `${baseUrl}/v1.0/removebg/ticket/release`;
+            }
+            try {
+              const relRes = await this.helpers.httpRequest({
+                method: "POST",
+                url: safeReleaseUrl,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Api-Key": apiKey,
+                },
+                body: { holdId, releaseToken },
+                json: true,
+                disableFollowRedirect: true,
+                sendCredentialsOnCrossOriginRedirect: false,
+                returnFullResponse: true,
+                ignoreHttpStatusErrors: true,
+              });
+              const relStatus =
+                relRes && typeof relRes.statusCode === "number" ? relRes.statusCode : 200;
+              return relStatus >= 200 && relStatus < 300;
+            } catch {
+              return false;
+            }
+          };
+
+          if (
+            !tData ||
+            typeof tData.directEndpoint !== "string" ||
+            !tData.directEndpoint.trim() ||
+            typeof tData.ticket !== "string" ||
+            !tData.ticket.trim()
+          ) {
+            await releaseTicketHold();
             throw new Error("Invalid /v1.0/removebg/ticket response from remove.ac");
           }
 
-          const directEndpoint = String(tJson.data.directEndpoint);
+          const directEndpoint = tData.directEndpoint.trim();
           if (!allowLoopback) {
-            await validatePublicUrl(directEndpoint, {
-              requireHttps: true,
-              lookupFn,
-            });
+            try {
+              await validatePublicUrl(directEndpoint, {
+                requireHttps: true,
+                lookupFn,
+              });
+            } catch (epErr) {
+              await releaseTicketHold();
+              throw epErr;
+            }
           }
 
-          const mp = buildMultipartFormData(
-            {},
-            {
-              fieldName: "image_file",
-              fileName: sourceFileName,
-              mimeType: sourceMimeType,
-              buffer: sourceBytes,
-            },
-            bgFilePart
-          );
+          let dRes;
+          try {
+            dRes = await this.helpers.httpRequest({
+              method: "POST",
+              url: directEndpoint,
+              headers: {
+                Authorization: `Bearer ${tData.ticket.trim()}`,
+                "Content-Type": `multipart/form-data; boundary=${mp.boundary}`,
+              },
+              body: mp.body,
+              encoding: "arraybuffer",
+              json: false,
+              disableFollowRedirect: true,
+              sendCredentialsOnCrossOriginRedirect: false,
+              returnFullResponse: true,
+              ignoreHttpStatusErrors: true,
+            });
+          } catch (netErr) {
+            await releaseTicketHold();
+            throw netErr;
+          }
 
-          const dRes = await this.helpers.httpRequest({
-            method: "POST",
-            url: directEndpoint,
-            headers: {
-              Authorization: `Bearer ${tJson.data.ticket}`,
-              "Content-Type": `multipart/form-data; boundary=${mp.boundary}`,
-            },
-            body: mp.body,
-            encoding: "arraybuffer",
-            json: false,
-            disableFollowRedirect: true,
-            sendCredentialsOnCrossOriginRedirect: false,
-            returnFullResponse: true,
-            ignoreHttpStatusErrors: true,
-          });
-
-          if (dRes.statusCode < 200 || dRes.statusCode >= 300) {
-            const errTxt = Buffer.from(dRes.body || "").toString("utf8");
-            throw new Error(`[HTTP ${dRes.statusCode}] ${errTxt}`);
+          const dStatus =
+            dRes && typeof dRes.statusCode === "number" ? dRes.statusCode : 200;
+          if (dStatus < 200 || dStatus >= 300) {
+            if (
+              (dStatus >= 300 && dStatus < 400) ||
+              dStatus === 400 ||
+              dStatus === 413 ||
+              (dStatus >= 502 && dStatus <= 504)
+            ) {
+              await releaseTicketHold();
+            }
+            const dBody =
+              dRes && typeof dRes === "object" && "statusCode" in dRes ? dRes.body : dRes;
+            throw new Error(`[HTTP ${dStatus}] ${formatErrorBody(dBody)}`);
           }
           return dRes;
         };
 
         let rawResponse;
-        const needsTicketUpfront =
-          sourceBytes &&
-          (sourceBytes.byteLength > DIRECT_THRESHOLD_BYTES ||
+        const needsTicketUpfront = Boolean(
+          additional.direct ||
             (bgBytes && bgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
-            (bgBytes && sourceBytes.byteLength + bgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
-            shouldPreFlightViaTicket(sourceBytes, size, format, channels, crop));
+            (sourceBytes &&
+              (sourceBytes.byteLength > DIRECT_THRESHOLD_BYTES ||
+                (bgBytes && sourceBytes.byteLength + bgBytes.byteLength > DIRECT_THRESHOLD_BYTES) ||
+                shouldPreFlightViaTicket(sourceBytes, size, format, channels, crop)))
+        );
 
         if (needsTicketUpfront) {
           rawResponse = await runTicketStream("direct");
@@ -904,46 +1181,74 @@ class RemoveAc {
                 bgFilePart
               );
 
-          const directRes = await this.helpers.httpRequest({
-            method: "POST",
-            url: `${baseUrl}/v1.0/removebg`,
-            headers: {
-              "X-Api-Key": apiKey,
-              "Idempotency-Key": idem,
-              "Content-Type": `multipart/form-data; boundary=${mp.boundary}`,
-            },
-            body: mp.body,
-            encoding: "arraybuffer",
-            json: false,
-            disableFollowRedirect: true,
-            sendCredentialsOnCrossOriginRedirect: false,
-            returnFullResponse: true,
-            ignoreHttpStatusErrors: true,
-          });
-
-          if (directRes.statusCode === 413 && sourceBytes) {
-            rawResponse = await runTicketStream("fallback413");
-          } else if (directRes.statusCode < 200 || directRes.statusCode >= 300) {
-            const errTxt = Buffer.from(directRes.body || "").toString("utf8");
-            throw new Error(`[HTTP ${directRes.statusCode}] ${errTxt}`);
+          if (mp.body.byteLength > DIRECT_THRESHOLD_BYTES) {
+            rawResponse = await runTicketStream("direct");
           } else {
-            rawResponse = directRes;
+            const directRes = await this.helpers.httpRequest({
+              method: "POST",
+              url: `${baseUrl}/v1.0/removebg`,
+              headers: {
+                "X-Api-Key": apiKey,
+                "Idempotency-Key": idem,
+                "Content-Type": `multipart/form-data; boundary=${mp.boundary}`,
+              },
+              body: mp.body,
+              encoding: "arraybuffer",
+              json: false,
+              disableFollowRedirect: true,
+              sendCredentialsOnCrossOriginRedirect: false,
+              returnFullResponse: true,
+              ignoreHttpStatusErrors: true,
+            });
+
+            if (directRes.statusCode === 413 && (sourceBytes || sourceUrl)) {
+              rawResponse = await runTicketStream("fallback413");
+            } else if (directRes.statusCode < 200 || directRes.statusCode >= 300) {
+              throw new Error(`[HTTP ${directRes.statusCode}] ${formatErrorBody(directRes.body)}`);
+            } else {
+              rawResponse = directRes;
+            }
           }
         }
 
-        const cutoutBuffer = Buffer.from(rawResponse.body);
+        const cutoutBuffer = toNodeBuffer(rawResponse.body);
+        if (!cutoutBuffer) {
+          throw new Error("Received empty or unsupported binary response from remove.ac.");
+        }
         const respHeaders = rawResponse.headers || {};
-        const outExt =
-          format === "jpg" ? "jpg" : format === "webp" ? "webp" : format === "zip" ? "zip" : "png";
+        const rawContentType = readHeader(respHeaders, "content-type")
+          .split(";")[0]
+          .trim()
+          .toLowerCase();
         const defaultMime =
-          format === "jpg"
+          format === "jpg" || format === "jpeg"
             ? "image/jpeg"
             : format === "webp"
               ? "image/webp"
               : format === "zip"
                 ? "application/zip"
                 : "image/png";
-        const outMime = readHeader(respHeaders, "content-type") || defaultMime;
+        const outMime = rawContentType || defaultMime;
+        let outExt;
+        if (format === "auto" || format === "jpg" || format === "jpeg") {
+          if (outMime === "image/jpeg" || outMime === "image/jpg") {
+            outExt = "jpg";
+          } else if (outMime === "image/webp") {
+            outExt = "webp";
+          } else if (outMime === "application/zip" || outMime === "application/x-zip-compressed") {
+            outExt = "zip";
+          } else if (format === "jpg" || format === "jpeg") {
+            outExt = "jpg";
+          } else {
+            outExt = "png";
+          }
+        } else if (format === "webp") {
+          outExt = "webp";
+        } else if (format === "zip") {
+          outExt = "zip";
+        } else {
+          outExt = "png";
+        }
         const stem = sourceFileName.replace(/\.[^.]+$/, "") || "image";
         const outFileName = `${stem}-nobg.${outExt}`;
 

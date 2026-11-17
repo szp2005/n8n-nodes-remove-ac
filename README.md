@@ -10,7 +10,7 @@ Official zero-dependency **[n8n](https://n8n.io)** community node for **[remove.
 
 ## Why Use `n8n-nodes-remove-ac`?
 
-1. **Drop-In Replacement for Deprecated `Remove.bg` Workflows:** Accepts upstream n8n binary items (`data`) or public image URLs, supports custom background image binaries (`bgImageBinaryProperty` / `bg_image_file`) or URLs (`bgImageUrl`), and outputs ready-to-upload cutout binaries (`PNG`, `WebP`, `JPG`, `ZIP`) plus `X-Foreground-*` bounding-box metadata.
+1. **Drop-In Replacement for Deprecated `Remove.bg` Workflows:** Accepts upstream n8n binary items (`data`) or public image URLs, supports custom background image binaries (`bgImageBinaryProperty` / `bg_image_file`) or URLs (`bgImageUrl`), and outputs ready-to-upload cutout binaries (`Auto`, `PNG`, `WebP`, `JPG`, `ZIP`) plus `X-Foreground-*` bounding-box metadata.
 2. **Automatic `> 4 MB` Zero-Disk GPU Streaming (Up to `25 MB / 50 MP`):** Large studio product photos across `25mp`, `50mp`, `full`, and `auto` tiers automatically negotiate a 180-second single-use HMAC ticket (`POST /v1.0/removebg/ticket`) to bypass serverless payload caps without persisting source or output pixels to disk.
 3. **AI Agent Tool Ready (`usableAsTool: true`):** Works both as a standard pipeline transform node and as a callable tool inside n8n AI Agent workflows.
 4. **Zero External Runtime Dependencies & SSRF Hardened:** Built strictly on Node.js built-in primitives and n8n's `httpRequest` helper with IPv4/IPv6/NAT64/DNS private-network blocking.
