@@ -19,7 +19,7 @@ class RemoveAcApi {
         required: true,
         placeholder: "rac_live_...",
         description:
-          "Your remove.ac API key. Verified email accounts include 1 free welcome credit at https://remove.ac/api-info.",
+          "Your remove.ac API key. Verified email accounts include 10 full-resolution welcome credits (valid 30 days) at https://remove.ac/api-info.",
       },
       {
         displayName: "Base URL",
