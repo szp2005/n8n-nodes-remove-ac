@@ -1,6 +1,10 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RemoveAc =
+  exports.parseForegroundMetadata =
+  exports.detectImageMagic =
+  exports.validateDirectEndpointUrl =
+  exports.isAllowedDirectEndpointHost =
   exports.normalizeShadowOptions =
   exports.formatErrorBody =
   exports.toNodeBuffer =
@@ -181,7 +185,11 @@ async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.
     throw new Error(`Hostname '${host}' returned no DNS records`);
   }
   const allowTunFakeIp =
-    parsed.protocol === "https:" && (host === "remove.ac" || host.endsWith(".remove.ac"));
+    parsed.protocol === "https:" &&
+    !host.startsWith(".") &&
+    !host.endsWith(".") &&
+    !host.includes("..") &&
+    (host === "remove.ac" || host.endsWith(".remove.ac"));
   for (const rec of list) {
     const addr = String(rec && rec.address ? rec.address : "").trim();
     if (net.isIPv4(addr)) {
@@ -198,6 +206,120 @@ async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.
   return parsed;
 }
 exports.validatePublicUrl = validatePublicUrl;
+
+function normalizeHostname(rawHost) {
+  return String(rawHost || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+}
+
+function isAllowedDirectEndpointHost(directHost, baseHost) {
+  const host = normalizeHostname(directHost);
+  if (!host || host.startsWith(".") || host.endsWith(".") || host.includes("..")) {
+    return false;
+  }
+  if (host === "remove.ac" || host.endsWith(".remove.ac")) {
+    return true;
+  }
+  const allowedBase = normalizeHostname(baseHost);
+  return Boolean(allowedBase && host === allowedBase);
+}
+exports.isAllowedDirectEndpointHost = isAllowedDirectEndpointHost;
+
+async function validateDirectEndpointUrl(
+  rawUrl,
+  { baseUrl = DEFAULT_BASE_URL, allowLoopback = false, lookupFn = dns.promises.lookup } = {}
+) {
+  let parsedBase;
+  try {
+    parsedBase = new URL(String(baseUrl || DEFAULT_BASE_URL));
+  } catch {
+    throw new Error(`Invalid base URL: '${baseUrl}'`);
+  }
+
+  let parsedDirect;
+  try {
+    parsedDirect = new URL(String(rawUrl));
+  } catch {
+    throw new Error(`Invalid directEndpoint URL: '${rawUrl}'`);
+  }
+
+  if (parsedDirect.username || parsedDirect.password) {
+    throw new Error("directEndpoint URLs with embedded credentials are not permitted");
+  }
+
+  if (!isAllowedDirectEndpointHost(parsedDirect.hostname, parsedBase.hostname)) {
+    throw new Error(
+      `Untrusted directEndpoint host '${parsedDirect.hostname}': only remove.ac, *.remove.ac, or configured baseUrl host are permitted.`
+    );
+  }
+
+  if (allowLoopback) {
+    const sameLoopbackHttp =
+      parsedBase.protocol === "http:" &&
+      parsedDirect.protocol === "http:" &&
+      normalizeHostname(parsedDirect.hostname) === normalizeHostname(parsedBase.hostname);
+    if (parsedDirect.protocol !== "https:" && !sameLoopbackHttp) {
+      throw new Error("Endpoint URL must use https://");
+    }
+    return parsedDirect;
+  }
+
+  return validatePublicUrl(parsedDirect.toString(), {
+    requireHttps: true,
+    lookupFn,
+  });
+}
+exports.validateDirectEndpointUrl = validateDirectEndpointUrl;
+
+function detectImageMagic(input) {
+  const bytes =
+    input instanceof ArrayBuffer ? new Uint8Array(input) : input instanceof Uint8Array ? input : null;
+  if (!bytes || bytes.byteLength < 3) return null;
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  if (
+    bytes.byteLength >= 6 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  ) {
+    return "image/gif";
+  }
+  return null;
+}
+exports.detectImageMagic = detectImageMagic;
 
 function parseImageDimensions(input) {
   const bytes =
@@ -450,13 +572,49 @@ function buildMultipartFormData(fields, filePart, extraFileParts = []) {
 function readHeader(headers, name) {
   if (!headers) return "";
   const lower = name.toLowerCase();
+  if (typeof headers.get === "function") {
+    const direct = headers.get(name);
+    if (direct !== null && direct !== undefined) return String(direct);
+    if (typeof headers.entries === "function") {
+      for (const [k, v] of headers.entries()) {
+        if (String(k).toLowerCase() === lower) {
+          return Array.isArray(v) ? String(v[0] ?? "") : String(v ?? "");
+        }
+      }
+    }
+    return "";
+  }
   for (const [k, v] of Object.entries(headers)) {
     if (k.toLowerCase() === lower) {
-      return Array.isArray(v) ? String(v[0] || "") : String(v ?? "");
+      return Array.isArray(v) ? String(v[0] ?? "") : String(v ?? "");
     }
   }
   return "";
 }
+
+function parseOptionalHeaderInt(headers, name) {
+  const raw = readHeader(headers, name).trim();
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function parseOptionalHeaderFloat(headers, name) {
+  const raw = readHeader(headers, name).trim();
+  if (!raw) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function parseForegroundMetadata(headers) {
+  return {
+    foregroundTop: parseOptionalHeaderInt(headers, "x-foreground-top"),
+    foregroundLeft: parseOptionalHeaderInt(headers, "x-foreground-left"),
+    foregroundWidth: parseOptionalHeaderInt(headers, "x-foreground-width"),
+    foregroundHeight: parseOptionalHeaderInt(headers, "x-foreground-height"),
+  };
+}
+exports.parseForegroundMetadata = parseForegroundMetadata;
 
 function extractTotalCredits(acct) {
   const top = acct && acct.data && acct.data.attributes ? acct.data.attributes : acct;
@@ -774,10 +932,10 @@ class RemoveAc {
           continue;
         }
 
-        const inputSource = this.getNodeParameter("inputSource", i);
-        const outputBinaryPropertyName = this.getNodeParameter("outputBinaryPropertyName", i);
-        const size = this.getNodeParameter("size", i);
-        const format = this.getNodeParameter("format", i);
+        const inputSource = this.getNodeParameter("inputSource", i, "binary");
+        const outputBinaryPropertyName = this.getNodeParameter("outputBinaryPropertyName", i, "data");
+        const size = this.getNodeParameter("size", i, "full");
+        const format = this.getNodeParameter("format", i, "png");
         const additional = this.getNodeParameter("additionalOptions", i, {}) || {};
         const channels = additional.channels || "rgba";
         const crop = Boolean(additional.crop);
@@ -828,8 +986,37 @@ class RemoveAc {
         let sourceUrl = null;
         let fgDims = null;
 
-        if (inputSource === "binary") {
-          const binaryPropertyName = this.getNodeParameter("binaryPropertyName", i);
+        let effectiveInputSource = inputSource;
+        let fallbackImageUrl = "";
+
+        if (effectiveInputSource === "binary") {
+          const binaryPropertyName = this.getNodeParameter("binaryPropertyName", i, "data");
+          const hasBinary = Boolean(
+            items[i] && items[i].binary && items[i].binary[binaryPropertyName]
+          );
+          if (!hasBinary) {
+            try {
+              const paramUrl = this.getNodeParameter("imageUrl", i, "");
+              if (typeof paramUrl === "string" && paramUrl.trim()) {
+                fallbackImageUrl = paramUrl.trim();
+              }
+            } catch {
+              // Parameter may be unset when inputSource is "binary"
+            }
+            if (!fallbackImageUrl && items[i] && items[i].json && typeof items[i].json === "object") {
+              const jsonUrl = items[i].json.imageUrl ?? items[i].json.image_url;
+              if (typeof jsonUrl === "string" && jsonUrl.trim()) {
+                fallbackImageUrl = jsonUrl.trim();
+              }
+            }
+            if (fallbackImageUrl) {
+              effectiveInputSource = "url";
+            }
+          }
+        }
+
+        if (effectiveInputSource === "binary") {
+          const binaryPropertyName = this.getNodeParameter("binaryPropertyName", i, "data");
           const binaryMeta = this.helpers.assertBinaryData(i, binaryPropertyName);
           sourceBytes = toNodeBuffer(await this.helpers.getBinaryDataBuffer(i, binaryPropertyName));
           if (!sourceBytes || sourceBytes.byteLength === 0) {
@@ -845,7 +1032,8 @@ class RemoveAc {
           sourceFileName = binaryMeta.fileName || "image.png";
           sourceMimeType = binaryMeta.mimeType || "application/octet-stream";
         } else {
-          const rawImageUrl = String(this.getNodeParameter("imageUrl", i) || "").trim();
+          const rawImageUrl =
+            fallbackImageUrl || String(this.getNodeParameter("imageUrl", i, "") || "").trim();
           const validated = await validatePublicUrl(rawImageUrl, {
             requireHttps: false,
             lookupFn,
@@ -901,9 +1089,7 @@ class RemoveAc {
             }
 
             if (status < 200 || status >= 300) {
-              throw new Error(
-                `Failed to fetch remote image [HTTP ${status}]: ${formatErrorBody(rawBody)}`
-              );
+              throw new Error(`Failed to fetch remote image [HTTP ${status}]`);
             }
 
             const fetchedBuf = toNodeBuffer(rawBody);
@@ -915,11 +1101,16 @@ class RemoveAc {
                 `Remote image exceeds remove.ac 25 MB limit (${fetchedBuf.byteLength} bytes).`
               );
             }
+            const detectedMime = detectImageMagic(fetchedBuf);
+            if (!detectedMime) {
+              throw new Error(
+                "Remote image URL did not return a valid PNG, JPEG, WebP, or GIF image."
+              );
+            }
             const dims = validateAndParseImageDimensions(fetchedBuf, "Remote input image");
-            const contentType = readHeader(respHeaders, "content-type").split(";")[0].trim();
             return {
               buffer: fetchedBuf,
-              mimeType: contentType || "application/octet-stream",
+              mimeType: detectedMime,
               dims,
             };
           }
@@ -1102,17 +1293,18 @@ class RemoveAc {
             throw new Error("Invalid /v1.0/removebg/ticket response from remove.ac");
           }
 
-          const directEndpoint = tData.directEndpoint.trim();
-          if (!allowLoopback) {
-            try {
-              await validatePublicUrl(directEndpoint, {
-                requireHttps: true,
-                lookupFn,
-              });
-            } catch (epErr) {
-              await releaseTicketHold();
-              throw epErr;
-            }
+          const rawDirectEndpoint = tData.directEndpoint.trim();
+          let directEndpoint;
+          try {
+            const parsedDirect = await validateDirectEndpointUrl(rawDirectEndpoint, {
+              baseUrl,
+              allowLoopback,
+              lookupFn,
+            });
+            directEndpoint = parsedDirect.toString();
+          } catch (epErr) {
+            await releaseTicketHold();
+            throw epErr;
           }
 
           let dRes;
@@ -1140,14 +1332,7 @@ class RemoveAc {
           const dStatus =
             dRes && typeof dRes.statusCode === "number" ? dRes.statusCode : 200;
           if (dStatus < 200 || dStatus >= 300) {
-            if (
-              (dStatus >= 300 && dStatus < 400) ||
-              dStatus === 400 ||
-              dStatus === 413 ||
-              (dStatus >= 502 && dStatus <= 504)
-            ) {
-              await releaseTicketHold();
-            }
+            await releaseTicketHold();
             const dBody =
               dRes && typeof dRes === "object" && "statusCode" in dRes ? dRes.body : dRes;
             throw new Error(`[HTTP ${dStatus}] ${formatErrorBody(dBody)}`);
@@ -1258,17 +1443,20 @@ class RemoveAc {
           outMime
         );
 
+        const parsedOutDims = parseImageDimensions(cutoutBuffer);
+        const headerWidth = parseOptionalHeaderInt(respHeaders, "x-width");
+        const headerHeight = parseOptionalHeaderInt(respHeaders, "x-height");
+        const creditsCharged = parseOptionalHeaderFloat(respHeaders, "x-credits-charged");
+        const foregroundMeta = parseForegroundMetadata(respHeaders);
+
         returnData.push({
           json: {
             ...(items[i].json || {}),
             removeAc: {
-              creditsCharged: Number.parseFloat(readHeader(respHeaders, "x-credits-charged") || "0"),
-              width: Number.parseInt(readHeader(respHeaders, "x-width") || "0", 10),
-              height: Number.parseInt(readHeader(respHeaders, "x-height") || "0", 10),
-              foregroundTop: Number.parseInt(readHeader(respHeaders, "x-foreground-top") || "0", 10),
-              foregroundLeft: Number.parseInt(readHeader(respHeaders, "x-foreground-left") || "0", 10),
-              foregroundWidth: Number.parseInt(readHeader(respHeaders, "x-foreground-width") || "0", 10),
-              foregroundHeight: Number.parseInt(readHeader(respHeaders, "x-foreground-height") || "0", 10),
+              creditsCharged: creditsCharged !== null ? creditsCharged : 0,
+              width: headerWidth !== null ? headerWidth : parsedOutDims ? parsedOutDims.width : null,
+              height: headerHeight !== null ? headerHeight : parsedOutDims ? parsedOutDims.height : null,
+              ...foregroundMeta,
               bytes: cutoutBuffer.byteLength,
               mimeType: outMime,
               fileName: outFileName,
