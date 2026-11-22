@@ -6,10 +6,14 @@ const require = createRequire(import.meta.url);
 const { RemoveAcApi } = require("../dist/credentials/RemoveAcApi.credentials.js");
 const {
   RemoveAc,
+  detectImageMagic,
   formatErrorBody,
+  isAllowedDirectEndpointHost,
   normalizeShadowOptions,
+  parseForegroundMetadata,
   parseImageDimensions,
   toNodeBuffer,
+  validateDirectEndpointUrl,
   validatePublicUrl,
 } = require("../dist/nodes/RemoveAc/RemoveAc.node.js");
 
@@ -998,4 +1002,621 @@ test("R2 MF-3, MF-4 & Probe 8: shadowType semantics, 50 MP pre-guard, object err
       `Expected SSRF block for ${vec}`
     );
   }
+});
+
+test("M-P1-11 (P1-05): releases ticket credit holds on ALL non-2xx directEndpoint errors (401/403/408/415/422/429/500) & network errors without masking original error", async () => {
+  const node = new RemoveAc();
+  const png9Mp = makePngHeader(3000, 3000, 64);
+
+  for (const statusCode of [401, 403, 408, 415, 422, 429, 500]) {
+    let releaseCalls = 0;
+    let releasePayload = null;
+    const ctx = createMockExecuteContext({
+      items: [{ json: {}, binary: { data: { fileName: "shot.png", mimeType: "image/png" } } }],
+      binaryBuffers: { data: png9Mp },
+      params: {
+        operation: "removeBackground",
+        inputSource: "binary",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        size: "50mp",
+        format: "png",
+        additionalOptions: {},
+      },
+      httpRequest: async (opts) => {
+        if (opts.url.endsWith("/v1.0/removebg/ticket")) {
+          return {
+            statusCode: 200,
+            body: {
+              data: {
+                ticket: `tkt_${statusCode}`,
+                directEndpoint: "http://127.0.0.1:9999/v1.0/direct-cutout",
+                holdId: `hold_${statusCode}`,
+                releaseToken: `rel_${statusCode}`,
+              },
+            },
+          };
+        }
+        if (opts.url.endsWith("/v1.0/removebg/ticket/release")) {
+          releaseCalls += 1;
+          releasePayload = opts.body;
+          assert.equal(opts.headers["X-Api-Key"], "rac_live_n8n_key");
+          return { statusCode: 200, body: { ok: true } };
+        }
+        return {
+          statusCode,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ errors: [{ code: `err_${statusCode}` }] })),
+        };
+      },
+    });
+
+    await assert.rejects(
+      () => node.execute.call(ctx),
+      new RegExp(`\\[HTTP ${statusCode}\\].*err_${statusCode}`),
+      `Expected HTTP ${statusCode} error to surface`
+    );
+    assert.equal(releaseCalls, 1, `Expected releaseTicketHold() on HTTP ${statusCode}`);
+    assert.deepEqual(releasePayload, {
+      holdId: `hold_${statusCode}`,
+      releaseToken: `rel_${statusCode}`,
+    });
+  }
+
+  // 409 Conflict or thrown error during releaseTicketHold() must NEVER mask original directEndpoint error
+  for (const releaseOutcome of ["409", "throw"]) {
+    let releaseAttempted = 0;
+    const ctx = createMockExecuteContext({
+      items: [{ json: {}, binary: { data: { fileName: "shot.png", mimeType: "image/png" } } }],
+      binaryBuffers: { data: png9Mp },
+      params: {
+        operation: "removeBackground",
+        inputSource: "binary",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        size: "50mp",
+        format: "png",
+        additionalOptions: {},
+      },
+      httpRequest: async (opts) => {
+        if (opts.url.endsWith("/v1.0/removebg/ticket")) {
+          return {
+            statusCode: 200,
+            body: {
+              data: {
+                ticket: "tkt_500",
+                directEndpoint: "http://127.0.0.1:9999/v1.0/direct-cutout",
+                holdId: "hold_500",
+                releaseToken: "rel_500",
+              },
+            },
+          };
+        }
+        if (opts.url.endsWith("/v1.0/removebg/ticket/release")) {
+          releaseAttempted += 1;
+          if (releaseOutcome === "throw") {
+            throw new Error("release network hiccup");
+          }
+          return { statusCode: 409, body: { errors: [{ code: "already_captured" }] } };
+        }
+        return {
+          statusCode: 500,
+          headers: { "content-type": "text/plain" },
+          body: Buffer.from("upstream failure"),
+        };
+      },
+    });
+
+    await assert.rejects(() => node.execute.call(ctx), /\[HTTP 500\] upstream failure/);
+    assert.equal(releaseAttempted, 1);
+  }
+
+  // Thrown network/timeout error on directEndpoint releases hold and rethrows original error
+  let netReleaseCalls = 0;
+  const netErrCtx = createMockExecuteContext({
+    items: [{ json: {}, binary: { data: { fileName: "shot.png", mimeType: "image/png" } } }],
+    binaryBuffers: { data: png9Mp },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "50mp",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async (opts) => {
+      if (opts.url.endsWith("/v1.0/removebg/ticket")) {
+        return {
+          statusCode: 200,
+          body: {
+            data: {
+              ticket: "tkt_timeout",
+              directEndpoint: "http://127.0.0.1:9999/v1.0/direct-cutout",
+              holdId: "hold_timeout",
+              releaseToken: "rel_timeout",
+            },
+          },
+        };
+      }
+      if (opts.url.endsWith("/v1.0/removebg/ticket/release")) {
+        netReleaseCalls += 1;
+        return { statusCode: 200, body: { ok: true } };
+      }
+      throw new Error("ETIMEDOUT direct upload");
+    },
+  });
+  await assert.rejects(() => node.execute.call(netErrCtx), /ETIMEDOUT direct upload/);
+  assert.equal(netReleaseCalls, 1);
+});
+
+test("M-P1-08 (P1-02): enforces strict directEndpoint host allowlist (rejects evil.com & *.modal.run) and hardens fetchRemoteImageBytes", async () => {
+  const node = new RemoveAc();
+  const png9Mp = makePngHeader(3000, 3000, 64);
+  const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
+  const tunFakeIpLookup = async () => [{ address: "198.18.0.12", family: 4 }];
+
+  // 1. Host allowlist helper & validateDirectEndpointUrl unit checks
+  assert.equal(isAllowedDirectEndpointHost("remove.ac", "remove.ac"), true);
+  assert.equal(isAllowedDirectEndpointHost("api.remove.ac", "remove.ac"), true);
+  assert.equal(isAllowedDirectEndpointHost("direct.edge.remove.ac", "remove.ac"), true);
+  assert.equal(isAllowedDirectEndpointHost("staging.example.com", "staging.example.com"), true);
+  assert.equal(isAllowedDirectEndpointHost("127.0.0.1", "127.0.0.1"), true);
+  assert.equal(isAllowedDirectEndpointHost("evil.com", "remove.ac"), false);
+  assert.equal(isAllowedDirectEndpointHost("evil.modal.run", "remove.ac"), false);
+  assert.equal(isAllowedDirectEndpointHost("remove-ac.modal.run", "remove.ac"), false);
+  assert.equal(isAllowedDirectEndpointHost("notremove.ac", "remove.ac"), false);
+  assert.equal(isAllowedDirectEndpointHost("remove.ac.evil.com", "remove.ac"), false);
+  assert.equal(isAllowedDirectEndpointHost(".remove.ac", "remove.ac"), false);
+
+  // Rejects evil.com & evil.modal.run WITHOUT performing DNS lookup
+  let untrustedDnsQueries = 0;
+  for (const badEndpoint of [
+    "https://evil.com/v1.0/direct-cutout",
+    "https://evil.modal.run/v1.0/direct-cutout",
+    "https://remove-ac.modal.run/v1.0/direct-cutout",
+    "https://remove.ac.evil.com/v1.0/direct-cutout",
+    "https://user:pass@api.remove.ac/v1.0/direct-cutout",
+    "http://api.remove.ac/v1.0/direct-cutout",
+  ]) {
+    await assert.rejects(
+      () =>
+        validateDirectEndpointUrl(badEndpoint, {
+          baseUrl: "https://remove.ac",
+          allowLoopback: false,
+          lookupFn: async () => {
+            untrustedDnsQueries += 1;
+            return [{ address: "93.184.216.34", family: 4 }];
+          },
+        }),
+      /Untrusted directEndpoint host|embedded credentials|must use https:\/\//
+    );
+  }
+  assert.equal(untrustedDnsQueries, 0, "Disallowed directEndpoint hosts must fail before DNS lookup");
+
+  // Allows first-party https://*.remove.ac with TUN fake-IP 198.18.0.0/15, while keeping third-party & http:// blocked
+  const allowedFirstParty = await validateDirectEndpointUrl("https://api.remove.ac/v1.0/direct-cutout", {
+    baseUrl: "https://remove.ac",
+    allowLoopback: false,
+    lookupFn: tunFakeIpLookup,
+  });
+  assert.equal(allowedFirstParty.hostname, "api.remove.ac");
+
+  await assert.rejects(
+    () => validatePublicUrl("https://cdn.example.com/a.png", { lookupFn: tunFakeIpLookup }),
+    /private IPv4 address/
+  );
+  await assert.rejects(
+    () => validatePublicUrl("http://remove.ac/a.png", { lookupFn: tunFakeIpLookup }),
+    /private IPv4 address/
+  );
+
+  // End-to-end: ticket returning evil.com or evil.modal.run is rejected with 0 hits to evil host AND releases hold
+  for (const evilEndpoint of [
+    "https://evil.com/v1.0/direct-cutout",
+    "https://evil.modal.run/v1.0/direct-cutout",
+  ]) {
+    let evilHits = 0;
+    let releaseHits = 0;
+    const ctx = createMockExecuteContext({
+      items: [{ json: {}, binary: { data: { fileName: "big.png", mimeType: "image/png" } } }],
+      credentials: { apiKey: "rac_live_n8n_key", baseUrl: "https://remove.ac" },
+      allowLoopbackBaseUrlForTest: false,
+      dnsLookupForTest: publicLookup,
+      binaryBuffers: { data: png9Mp },
+      params: {
+        operation: "removeBackground",
+        inputSource: "binary",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        size: "50mp",
+        format: "png",
+        additionalOptions: {},
+      },
+      httpRequest: async (opts) => {
+        if (opts.url === "https://remove.ac/v1.0/removebg/ticket") {
+          return {
+            statusCode: 200,
+            body: {
+              data: {
+                ticket: "tkt_evil",
+                directEndpoint: evilEndpoint,
+                holdId: "hold_evil",
+                releaseToken: "rel_evil",
+              },
+            },
+          };
+        }
+        if (opts.url === "https://remove.ac/v1.0/removebg/ticket/release") {
+          releaseHits += 1;
+          return { statusCode: 200, body: { ok: true } };
+        }
+        evilHits += 1;
+        throw new Error("evil directEndpoint must never be called");
+      },
+    });
+    await assert.rejects(() => node.execute.call(ctx), /Untrusted directEndpoint host/);
+    assert.equal(evilHits, 0);
+    assert.equal(releaseHits, 1);
+  }
+
+  // 2. detectImageMagic validates PNG/JPEG/WebP/GIF and rejects non-image payloads
+  assert.equal(detectImageMagic(TINY_PNG), "image/png");
+  assert.equal(detectImageMagic(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10])), "image/jpeg");
+  assert.equal(
+    detectImageMagic(Buffer.from("RIFF\x24\x00\x00\x00WEBPVP8 ", "latin1")),
+    "image/webp"
+  );
+  assert.equal(detectImageMagic(Buffer.from("GIF87a\x01\x00\x01\x00", "latin1")), "image/gif");
+  assert.equal(detectImageMagic(Buffer.from("GIF89a\x01\x00\x01\x00", "latin1")), "image/gif");
+  assert.equal(detectImageMagic(Buffer.from("<html><body>secret</body></html>")), null);
+  assert.equal(detectImageMagic(Buffer.from('{"secret":"token"}')), null);
+  assert.equal(detectImageMagic(Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>")), null);
+  assert.equal(detectImageMagic(Buffer.from("RIFF\x24\x00\x00\x00WAVEfmt ", "latin1")), null);
+
+  // 3. fetchRemoteImageBytes NEVER echoes raw third-party/internal HTTP error bodies
+  const leakSecret = "INTERNAL_AWS_METADATA_SECRET_TOKEN_XYZ987";
+  const errFetchCtx = createMockExecuteContext({
+    items: [{ json: {} }],
+    params: {
+      operation: "removeBackground",
+      inputSource: "url",
+      imageUrl: "https://cdn.example.com/private.png",
+      outputBinaryPropertyName: "data",
+      size: "50mp",
+      format: "png",
+      additionalOptions: { direct: true },
+    },
+    httpRequest: async () => ({
+      statusCode: 403,
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from(leakSecret),
+    }),
+  });
+  await assert.rejects(
+    () => node.execute.call(errFetchCtx),
+    (err) => {
+      assert.equal(err.message, "Failed to fetch remote image [HTTP 403]");
+      assert.equal(err.message.includes(leakSecret), false);
+      return true;
+    }
+  );
+
+  // 4. fetchRemoteImageBytes rejects non-image payloads (even with spoofed Content-Type: image/png) BEFORE ticket call
+  let ticketReached = false;
+  const badMagicCtx = createMockExecuteContext({
+    items: [{ json: {} }],
+    params: {
+      operation: "removeBackground",
+      inputSource: "url",
+      imageUrl: "https://cdn.example.com/not-an-image.png",
+      outputBinaryPropertyName: "data",
+      size: "50mp",
+      format: "png",
+      additionalOptions: { direct: true },
+    },
+    httpRequest: async (opts) => {
+      if (opts.url.includes("/v1.0/")) {
+        ticketReached = true;
+      }
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/png" },
+        body: Buffer.from("<html><body>Not actually a PNG</body></html>"),
+      };
+    },
+  });
+  await assert.rejects(
+    () => node.execute.call(badMagicCtx),
+    /did not return a valid PNG, JPEG, WebP, or GIF image/
+  );
+  assert.equal(ticketReached, false);
+
+  // 5. fetchRemoteImageBytes rejects >25 MB remote images BEFORE ticket call
+  const oversizedPng = makePngHeader(1000, 1000, 25 * 1024 * 1024 + 1);
+  let oversizedTicketReached = false;
+  const oversizedCtx = createMockExecuteContext({
+    items: [{ json: {} }],
+    params: {
+      operation: "removeBackground",
+      inputSource: "url",
+      imageUrl: "https://cdn.example.com/huge-26mb.png",
+      outputBinaryPropertyName: "data",
+      size: "50mp",
+      format: "png",
+      additionalOptions: { direct: true },
+    },
+    httpRequest: async (opts) => {
+      if (opts.url.includes("/v1.0/")) oversizedTicketReached = true;
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/png" },
+        body: oversizedPng,
+      };
+    },
+  });
+  await assert.rejects(() => node.execute.call(oversizedCtx), /exceeds remove\.ac 25 MB limit/);
+  assert.equal(oversizedTicketReached, false);
+});
+
+test("M-P1-10 (P1-04): parses X-Foreground-* headers case-insensitively and returns null (never misleading 0x0) when omitted", async () => {
+  const node = new RemoveAc();
+
+  // 1. Unit checks for parseForegroundMetadata: mixed-case plain object, Web Headers, explicit 0, omitted, invalid
+  assert.deepEqual(
+    parseForegroundMetadata({
+      "X-Foreground-Top": "12",
+      "X-FOREGROUND-LEFT": "34",
+      "x-foreground-width": "500",
+      "X-Foreground-Height": "400",
+    }),
+    {
+      foregroundTop: 12,
+      foregroundLeft: 34,
+      foregroundWidth: 500,
+      foregroundHeight: 400,
+    }
+  );
+
+  assert.deepEqual(
+    parseForegroundMetadata(
+      new Headers({
+        "X-Foreground-Top": "0",
+        "X-Foreground-Left": "0",
+        "X-Foreground-Width": "800",
+        "X-Foreground-Height": "600",
+      })
+    ),
+    {
+      foregroundTop: 0,
+      foregroundLeft: 0,
+      foregroundWidth: 800,
+      foregroundHeight: 600,
+    }
+  );
+
+  assert.deepEqual(parseForegroundMetadata({}), {
+    foregroundTop: null,
+    foregroundLeft: null,
+    foregroundWidth: null,
+    foregroundHeight: null,
+  });
+
+  assert.deepEqual(
+    parseForegroundMetadata({
+      "X-Foreground-Top": "",
+      "X-Foreground-Left": "-5",
+      "X-Foreground-Width": "NaN",
+      "X-Foreground-Height": "120px",
+    }),
+    {
+      foregroundTop: null,
+      foregroundLeft: null,
+      foregroundWidth: null,
+      foregroundHeight: null,
+    }
+  );
+
+  // 2. End-to-end execution when X-Foreground-* headers are omitted (e.g. direct-cutout stream without bbox headers)
+  const omittedCtx = createMockExecuteContext({
+    items: [{ json: {}, binary: { data: { fileName: "item.png", mimeType: "image/png" } } }],
+    binaryBuffers: { data: TINY_PNG },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async () => ({
+      statusCode: 200,
+      headers: {
+        "Content-Type": "image/png",
+        "X-Credits-Charged": "1",
+      },
+      body: makePngHeader(1200, 900, 64),
+    }),
+  });
+  const [omittedOut] = await node.execute.call(omittedCtx);
+  assert.equal(omittedOut[0].json.removeAc.width, 1200);
+  assert.equal(omittedOut[0].json.removeAc.height, 900);
+  assert.equal(omittedOut[0].json.removeAc.foregroundTop, null);
+  assert.equal(omittedOut[0].json.removeAc.foregroundLeft, null);
+  assert.equal(omittedOut[0].json.removeAc.foregroundWidth, null);
+  assert.equal(omittedOut[0].json.removeAc.foregroundHeight, null);
+
+  // 3. End-to-end execution with mixed-case X-Foreground-* headers (including valid 0 top/left)
+  const presentCtx = createMockExecuteContext({
+    items: [{ json: {}, binary: { data: { fileName: "crop.png", mimeType: "image/png" } } }],
+    binaryBuffers: { data: TINY_PNG },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: { crop: true },
+    },
+    httpRequest: async () => ({
+      statusCode: 200,
+      headers: {
+        "Content-Type": "image/png",
+        "X-Credits-Charged": "1",
+        "X-Width": "640",
+        "X-Height": "480",
+        "X-Foreground-Top": "0",
+        "X-Foreground-Left": "0",
+        "X-Foreground-Width": "640",
+        "X-Foreground-Height": "480",
+      },
+      body: TINY_PNG,
+    }),
+  });
+  const [presentOut] = await node.execute.call(presentCtx);
+  assert.equal(presentOut[0].json.removeAc.foregroundTop, 0);
+  assert.equal(presentOut[0].json.removeAc.foregroundLeft, 0);
+  assert.equal(presentOut[0].json.removeAc.foregroundWidth, 640);
+  assert.equal(presentOut[0].json.removeAc.foregroundHeight, 480);
+});
+
+test("M-P2-15 (P2-04): usableAsTool auto-falls back to URL mode when inputSource='binary' has no binary property", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const node = new RemoveAc();
+  assert.equal(node.description.usableAsTool, true);
+
+  // 1. Default inputSource="binary", no binary attachment, imageUrl parameter supplied -> auto-switches to URL mode
+  let paramBodyStr = "";
+  const paramUrlCtx = createMockExecuteContext({
+    items: [{ json: { toolCallId: "call_1" } }],
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      imageUrl: "https://cdn.example.com/agent-sneaker.jpg",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async (opts) => {
+      paramBodyStr = opts.body.toString("utf8");
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/png", "x-credits-charged": "1" },
+        body: TINY_PNG,
+      };
+    },
+  });
+  const [paramOut] = await node.execute.call(paramUrlCtx);
+  assert.match(paramBodyStr, /name="image_url"\r\n\r\nhttps:\/\/cdn\.example\.com\/agent-sneaker\.jpg/);
+  assert.equal(paramOut[0].binary.data.fileName, "agent-sneaker-nobg.png");
+
+  // 2. Default inputSource="binary", no binary attachment, items[i].json.imageUrl (and image_url) supplied -> auto-switches to URL mode
+  for (const jsonPayload of [
+    { imageUrl: "https://cdn.example.com/from-json.png" },
+    { image_url: "https://cdn.example.com/from-snake.webp" },
+  ]) {
+    let seenBody = "";
+    const jsonUrlCtx = createMockExecuteContext({
+      items: [{ json: jsonPayload }],
+      params: {
+        operation: "removeBackground",
+        inputSource: "binary",
+      },
+      httpRequest: async (opts) => {
+        seenBody = opts.body.toString("utf8");
+        return {
+          statusCode: 200,
+          headers: { "content-type": "image/png", "x-credits-charged": "1" },
+          body: TINY_PNG,
+        };
+      },
+    });
+    const [jsonOut] = await node.execute.call(jsonUrlCtx);
+    const expectedUrl = jsonPayload.imageUrl || jsonPayload.image_url;
+    assert.ok(seenBody.includes(expectedUrl));
+    assert.ok(jsonOut[0].binary.data.fileName.endsWith("-nobg.png"));
+  }
+
+  // 3. Fallback json.imageUrl pointing to private IP is STILL blocked by SSRF check with 0 HTTP calls
+  let ssrfHits = 0;
+  const ssrfJsonCtx = createMockExecuteContext({
+    items: [{ json: { imageUrl: "http://169.254.169.254/latest/meta-data/" } }],
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async () => {
+      ssrfHits += 1;
+      throw new Error("should not reach network");
+    },
+  });
+  await assert.rejects(() => node.execute.call(ssrfJsonCtx), /Private, loopback, or reserved IPv4/);
+  assert.equal(ssrfHits, 0);
+
+  // 4. When binary property IS present AND json.imageUrl also exists, binary takes precedence
+  let binPrecedenceBody = "";
+  const binPrecedenceCtx = createMockExecuteContext({
+    items: [
+      {
+        json: { imageUrl: "https://cdn.example.com/should-be-ignored.png" },
+        binary: { data: { fileName: "local-upload.png", mimeType: "image/png" } },
+      },
+    ],
+    binaryBuffers: { data: TINY_PNG },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async (opts) => {
+      binPrecedenceBody = opts.body.toString("utf8");
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/png", "x-credits-charged": "1" },
+        body: TINY_PNG,
+      };
+    },
+  });
+  const [binOut] = await node.execute.call(binPrecedenceCtx);
+  assert.match(binPrecedenceBody, /name="image_file"; filename="local-upload\.png"/);
+  assert.equal(binPrecedenceBody.includes("should-be-ignored.png"), false);
+  assert.equal(binOut[0].binary.data.fileName, "local-upload-nobg.png");
+
+  // 5. Missing binary property with NO fallback URL still fails cleanly via assertBinaryData
+  const missingBothCtx = createMockExecuteContext({
+    items: [{ json: { note: "no image here" } }],
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "full",
+      format: "png",
+      additionalOptions: {},
+    },
+    httpRequest: async () => {
+      throw new Error("should not reach network");
+    },
+  });
+  await assert.rejects(() => node.execute.call(missingBothCtx), /Missing binary property data/);
+
+  // 6. README documents setting Input Source = Image URL when attaching as an AI Agent tool
+  const readmePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "README.md");
+  const readme = fs.readFileSync(readmePath, "utf8");
+  assert.match(readme, /Input Source = Image URL/);
 });
