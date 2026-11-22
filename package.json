@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-remove-ac",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Official zero-dependency n8n community node for remove.ac (/v1.0/removebg drop-in background removal + up to 25 MB / 50 MP zero-disk GPU streaming).",
   "keywords": [
     "n8n-community-node-package",
