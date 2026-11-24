@@ -1,6 +1,14 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RemoveAc =
+  exports.fetchPinnedRemoteImageBytes =
+  exports.requestPinnedRemoteHop =
+  exports.resolveValidatedPublicUrl =
+  exports.VALID_FORMATS =
+  exports.VALID_SIZES =
+  exports.MAX_COMBINED_IMAGE_BYTES =
+  exports.MAX_DIRECT_BODY_BYTES =
+  exports.PACKAGE_VERSION =
   exports.parseForegroundMetadata =
   exports.detectImageMagic =
   exports.validateDirectEndpointUrl =
@@ -16,27 +24,58 @@ exports.RemoveAc =
 
 const crypto = require("node:crypto");
 const dns = require("node:dns");
+const http = require("node:http");
+const https = require("node:https");
 const net = require("node:net");
+
+const PACKAGE_VERSION = "1.0.3";
+exports.PACKAGE_VERSION = PACKAGE_VERSION;
+const USER_AGENT = `n8n-nodes-remove-ac/${PACKAGE_VERSION}`;
 
 const DEFAULT_BASE_URL = "https://remove.ac";
 const DIRECT_THRESHOLD_BYTES = 4 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
-const MAX_DIRECT_BODY_BYTES = 32 * 1024 * 1024;
-const MAX_COMBINED_IMAGE_BYTES = MAX_DIRECT_BODY_BYTES - 65536;
+const MAX_DIRECT_BODY_BYTES = 30 * 1024 * 1024;
+const MAX_COMBINED_IMAGE_BYTES = 30 * 1024 * 1024 - 512 * 1024; // 29.5 MB (30,932,992 bytes; leaves 512 KB multipart headroom under 30 MB envelope)
+exports.MAX_DIRECT_BODY_BYTES = MAX_DIRECT_BODY_BYTES;
+exports.MAX_COMBINED_IMAGE_BYTES = MAX_COMBINED_IMAGE_BYTES;
 const MAX_IMAGE_PIXELS = 50_000_000;
 const MAX_IMAGE_SIDE = 50_000;
 const MAX_REMOTE_REDIRECTS = 3;
+const REMOTE_FETCH_TIMEOUT_MS = 30_000;
 const DIRECT_RGBA_PNG_PIXELS = 5_000_000;
 const DIRECT_CROPPED_RGBA_PNG_PIXELS = 10_000_000;
+
+const VALID_SIZES = Object.freeze([
+  "auto",
+  "preview",
+  "small",
+  "regular",
+  "medium",
+  "hd",
+  "4k",
+  "25mp",
+  "50mp",
+  "full",
+  "maximum",
+]);
+const VALID_FORMATS = Object.freeze(["auto", "png", "jpg", "jpeg", "webp", "zip"]);
+exports.VALID_SIZES = VALID_SIZES;
+exports.VALID_FORMATS = VALID_FORMATS;
+const VALID_SIZE_SET = new Set(VALID_SIZES);
+const VALID_FORMAT_SET = new Set(VALID_FORMATS);
 
 function isPrivateIpv4Octets(a, b, c) {
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 100 && b >= 64 && b <= 127) return true;
   if (a === 169 && b === 254) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 0 && c === 0) return true;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+  if (a === 192 && b === 88 && c === 99) return true;
   if (a === 192 && b === 168) return true;
   if (a === 198 && (b === 18 || b === 19)) return true;
+  if (a === 198 && b === 51 && c === 100) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
   if (a >= 224) return true;
   return false;
 }
@@ -123,6 +162,12 @@ function isPrivateIpv6(ip) {
     if (w[2] === 1) return true;
   }
   if (w[0] === 0x0100 && w[1] === 0 && w[2] === 0 && w[3] === 0) return true;
+  if (w[0] === 0x2001 && (w[1] === 0x0000 || w[1] === 0x0db8 || (w[1] === 0x0002 && w[2] === 0))) {
+    return true;
+  }
+  if (w[0] === 0x2002) {
+    return isPrivateIpv4Words(w[1], w[2]);
+  }
   if ((w[0] & 0xfe00) === 0xfc00) return true;
   if ((w[0] & 0xffc0) === 0xfe80) return true;
   if ((w[0] & 0xffc0) === 0xfec0) return true;
@@ -131,7 +176,23 @@ function isPrivateIpv6(ip) {
 }
 exports.isPrivateIpv6 = isPrivateIpv6;
 
-async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.promises.lookup } = {}) {
+function unwrapIpv4MappedIpv6(rawIp) {
+  const w = parseIpv6Words(rawIp);
+  if (!w) return null;
+  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0xffff) {
+    const a = (w[6] >>> 8) & 0xff;
+    const b = w[6] & 0xff;
+    const c = (w[7] >>> 8) & 0xff;
+    const d = w[7] & 0xff;
+    return `${a}.${b}.${c}.${d}`;
+  }
+  return null;
+}
+
+async function resolveValidatedPublicUrl(
+  rawUrl,
+  { requireHttps = false, allowTunFakeIp, lookupFn = dns.promises.lookup } = {}
+) {
   let parsed;
   try {
     parsed = new URL(String(rawUrl));
@@ -148,7 +209,8 @@ async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.
     throw new Error("URLs with embedded credentials are not permitted");
   }
   const rawHost = parsed.hostname.toLowerCase();
-  const host = rawHost.replace(/^\[|\]$/g, "");
+  const unbracketedHost = rawHost.replace(/^\[|\]$/g, "");
+  const host = unbracketedHost.replace(/\.+$/, "");
   if (
     !host ||
     host === "localhost" ||
@@ -159,19 +221,32 @@ async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.
   ) {
     throw new Error("Local or internal hostnames are not permitted");
   }
-  if (rawHost.startsWith("[") || host.includes(":")) {
-    if (isPrivateIpv6(host)) {
+  if (rawHost.startsWith("[") || unbracketedHost.includes(":")) {
+    if (isPrivateIpv6(unbracketedHost)) {
       throw new Error("Private, loopback, or reserved IPv6 addresses are not permitted");
     }
-    return parsed;
+    const mappedV4 = unwrapIpv4MappedIpv6(unbracketedHost);
+    if (mappedV4) {
+      if (isPrivateIpv4(mappedV4)) {
+        throw new Error("Private, loopback, or reserved IPv6 addresses are not permitted");
+      }
+      return { url: parsed, host, addresses: [{ address: mappedV4, family: 4 }] };
+    }
+    const ipNoZone = unbracketedHost.split("%")[0];
+    return { url: parsed, host, addresses: [{ address: ipNoZone, family: 6 }] };
   }
   if (net.isIPv4(host)) {
     if (isPrivateIpv4(host)) {
       throw new Error("Private, loopback, or reserved IPv4 addresses are not permitted");
     }
-    return parsed;
+    return { url: parsed, host, addresses: [{ address: host, family: 4 }] };
   }
-  if (!host.includes(".") || /^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
+  const labels = host.split(".");
+  if (
+    labels.length < 2 ||
+    labels.some((lbl) => !lbl) ||
+    labels.every((lbl) => /^\d+$/.test(lbl) || /^0x[0-9a-f]+$/i.test(lbl))
+  ) {
     throw new Error("Single-label or numeric hostnames are not permitted");
   }
   let records;
@@ -184,26 +259,54 @@ async function validatePublicUrl(rawUrl, { requireHttps = false, lookupFn = dns.
   if (list.length === 0) {
     throw new Error(`Hostname '${host}' returned no DNS records`);
   }
-  const allowTunFakeIp =
+  const firstPartyHttps =
     parsed.protocol === "https:" &&
-    !host.startsWith(".") &&
-    !host.endsWith(".") &&
-    !host.includes("..") &&
+    !unbracketedHost.startsWith(".") &&
+    !unbracketedHost.endsWith(".") &&
+    !unbracketedHost.includes("..") &&
     (host === "remove.ac" || host.endsWith(".remove.ac"));
+  const effectiveAllowTunFakeIp =
+    allowTunFakeIp !== undefined ? Boolean(allowTunFakeIp) && firstPartyHttps : firstPartyHttps;
+
+  const pinnedAddresses = [];
   for (const rec of list) {
-    const addr = String(rec && rec.address ? rec.address : "").trim();
+    const rawAddr = typeof rec === "string" ? rec : rec && rec.address ? rec.address : "";
+    const addr = String(rawAddr).trim().replace(/^\[|\]$/g, "");
     if (net.isIPv4(addr)) {
       const octs = addr.split(".").map((s) => Number.parseInt(s, 10));
       const isRfc2544 = octs.length === 4 && octs[0] === 198 && (octs[1] === 18 || octs[1] === 19);
-      if (allowTunFakeIp && isRfc2544) continue;
+      if (effectiveAllowTunFakeIp && isRfc2544) {
+        pinnedAddresses.push({ address: addr, family: 4 });
+        continue;
+      }
       if (isPrivateIpv4(addr)) throw new Error(`Hostname '${host}' resolved to a private IPv4 address`);
+      pinnedAddresses.push({ address: addr, family: 4 });
     } else if (addr.includes(":")) {
       if (isPrivateIpv6(addr)) throw new Error(`Hostname '${host}' resolved to a private IPv6 address`);
+      const mappedV4 = unwrapIpv4MappedIpv6(addr);
+      if (mappedV4) {
+        if (isPrivateIpv4(mappedV4)) {
+          throw new Error(`Hostname '${host}' resolved to a private IPv6 address`);
+        }
+        pinnedAddresses.push({ address: mappedV4, family: 4 });
+      } else {
+        const ipNoZone = addr.split("%")[0];
+        pinnedAddresses.push({ address: ipNoZone, family: 6 });
+      }
     } else {
       throw new Error(`Hostname '${host}' resolved to an unrecognized address`);
     }
   }
-  return parsed;
+  if (pinnedAddresses.length === 0) {
+    throw new Error(`Hostname '${host}' returned no usable public IP records`);
+  }
+  return { url: parsed, host, addresses: pinnedAddresses };
+}
+exports.resolveValidatedPublicUrl = resolveValidatedPublicUrl;
+
+async function validatePublicUrl(rawUrl, options = {}) {
+  const resolved = await resolveValidatedPublicUrl(rawUrl, options);
+  return resolved.url;
 }
 exports.validatePublicUrl = validatePublicUrl;
 
@@ -490,10 +593,232 @@ function assertCombinedMultipartWithinLimit(fgBytes, bgImgBytes) {
     fgBytes.byteLength + bgImgBytes.byteLength > MAX_COMBINED_IMAGE_BYTES
   ) {
     throw new Error(
-      `Combined foreground (${fgBytes.byteLength} bytes) and background (${bgImgBytes.byteLength} bytes) exceed remove.ac 32 MB direct upload stream limit.`
+      `Combined foreground (${fgBytes.byteLength} bytes) and background (${bgImgBytes.byteLength} bytes) exceed remove.ac 29.5 MB combined image limit (${MAX_COMBINED_IMAGE_BYTES} bytes; 30 MB direct upload stream envelope).`
     );
   }
 }
+
+function requestPinnedRemoteHop(
+  parsedUrl,
+  pinnedAddresses,
+  { maxBytes = MAX_UPLOAD_BYTES, timeoutMs = REMOTE_FETCH_TIMEOUT_MS } = {}
+) {
+  return new Promise((resolve, reject) => {
+    if (!Array.isArray(pinnedAddresses) || pinnedAddresses.length === 0) {
+      reject(new Error("Missing pinned public IP address for remote image fetch."));
+      return;
+    }
+    const isHttps = parsedUrl.protocol === "https:";
+    const mod = isHttps ? https : http;
+    const cleanHost = parsedUrl.hostname.replace(/^\[|\]$/g, "");
+    const port = parsedUrl.port ? Number.parseInt(parsedUrl.port, 10) : isHttps ? 443 : 80;
+    const hostForHeader = cleanHost.includes(":") ? `[${cleanHost}]` : cleanHost;
+    const hostHeader = parsedUrl.port ? `${hostForHeader}:${parsedUrl.port}` : hostForHeader;
+
+    const reqOptions = {
+      protocol: parsedUrl.protocol,
+      hostname: cleanHost,
+      port,
+      path: `${parsedUrl.pathname || "/"}${parsedUrl.search || ""}`,
+      method: "GET",
+      headers: {
+        Host: hostHeader,
+        Accept: "image/*,*/*;q=0.8",
+        "User-Agent": USER_AGENT,
+      },
+      agent: false,
+      timeout: timeoutMs,
+      autoSelectFamily: pinnedAddresses.length > 1,
+      lookup: (_hostname, opts, cb) => {
+        const callback = typeof opts === "function" ? opts : cb;
+        if (opts && typeof opts === "object" && opts.all) {
+          callback(
+            null,
+            pinnedAddresses.map((entry) => ({ address: entry.address, family: entry.family }))
+          );
+          return;
+        }
+        const wantedFamily = opts && typeof opts === "object" ? opts.family : 0;
+        const match =
+          (wantedFamily ? pinnedAddresses.find((entry) => entry.family === wantedFamily) : null) ||
+          pinnedAddresses[0];
+        callback(null, match.address, match.family);
+      },
+    };
+    if (isHttps && !net.isIP(cleanHost)) {
+      reqOptions.servername = cleanHost;
+    }
+
+    let settled = false;
+    let req = null;
+    const hardTimer = setTimeout(() => {
+      if (req) req.destroy();
+      fail(new Error(`Timed out fetching remote image (${timeoutMs}ms).`));
+    }, timeoutMs);
+
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      resolve(val);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      reject(err);
+    };
+
+    req = mod.request(reqOptions, (res) => {
+      const status = res.statusCode || 0;
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const headersCopy = { ...(res.headers || {}) };
+        res.destroy();
+        finish({ statusCode: status, headers: headersCopy, body: Buffer.alloc(0) });
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        res.destroy();
+        fail(new Error(`Failed to fetch remote image [HTTP ${status}]`));
+        return;
+      }
+
+      const rawLen = res.headers && res.headers["content-length"];
+      if (rawLen !== undefined) {
+        const declaredLen = Number.parseInt(String(rawLen), 10);
+        if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+          res.destroy();
+          fail(new Error(`Remote image exceeds remove.ac 25 MB limit (${declaredLen} bytes).`));
+          return;
+        }
+      }
+
+      const chunks = [];
+      let total = 0;
+      res.on("data", (chunk) => {
+        if (settled) return;
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buf.byteLength;
+        if (total > maxBytes) {
+          res.destroy();
+          fail(new Error(`Remote image exceeds remove.ac 25 MB limit (${total} bytes).`));
+          return;
+        }
+        chunks.push(buf);
+      });
+      res.on("end", () => {
+        if (settled) return;
+        finish({
+          statusCode: status,
+          headers: { ...(res.headers || {}) },
+          body: Buffer.concat(chunks, total),
+        });
+      });
+      res.on("error", () => {
+        fail(new Error("Failed to read remote image response stream."));
+      });
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      fail(new Error(`Timed out fetching remote image (${timeoutMs}ms).`));
+    });
+    req.on("error", () => {
+      fail(new Error("Failed to connect to remote image host."));
+    });
+    req.end();
+  });
+}
+exports.requestPinnedRemoteHop = requestPinnedRemoteHop;
+
+async function fetchPinnedRemoteImageBytes(
+  initialUrl,
+  {
+    initialResolved = null,
+    lookupFn = dns.promises.lookup,
+    maxBytes = MAX_UPLOAD_BYTES,
+    timeoutMs = REMOTE_FETCH_TIMEOUT_MS,
+    maxRedirects = MAX_REMOTE_REDIRECTS,
+    transportForTest = null,
+  } = {}
+) {
+  let currentUrl = String(initialUrl);
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const resolved =
+      hop === 0 && initialResolved
+        ? initialResolved
+        : await resolveValidatedPublicUrl(currentUrl, {
+            requireHttps: false,
+            allowTunFakeIp: false,
+            lookupFn,
+          });
+    currentUrl = resolved.url.toString();
+
+    const imgRes =
+      typeof transportForTest === "function"
+        ? await transportForTest({
+            method: "GET",
+            url: currentUrl,
+            pinnedAddresses: resolved.addresses,
+            headers: {
+              Accept: "image/*,*/*;q=0.8",
+            },
+            encoding: "arraybuffer",
+            json: false,
+            disableFollowRedirect: true,
+            sendCredentialsOnCrossOriginRedirect: false,
+            returnFullResponse: true,
+            ignoreHttpStatusErrors: true,
+          })
+        : await requestPinnedRemoteHop(resolved.url, resolved.addresses, {
+            maxBytes,
+            timeoutMs,
+          });
+
+    const status = imgRes && typeof imgRes.statusCode === "number" ? imgRes.statusCode : 200;
+    const rawBody =
+      imgRes && typeof imgRes === "object" && "statusCode" in imgRes ? imgRes.body : imgRes;
+    const respHeaders = (imgRes && imgRes.headers) || {};
+
+    if ([301, 302, 303, 307, 308].includes(status)) {
+      const location = readHeader(respHeaders, "location").trim();
+      if (!location) {
+        throw new Error(`Remote image redirect [HTTP ${status}] missing Location header.`);
+      }
+      if (hop === maxRedirects) {
+        throw new Error(`Remote image URL exceeded maximum redirect limit (${maxRedirects}).`);
+      }
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`Failed to fetch remote image [HTTP ${status}]`);
+    }
+
+    const fetchedBuf = toNodeBuffer(rawBody);
+    if (!fetchedBuf || fetchedBuf.byteLength === 0) {
+      throw new Error("Remote image response body is empty.");
+    }
+    if (fetchedBuf.byteLength > maxBytes) {
+      throw new Error(`Remote image exceeds remove.ac 25 MB limit (${fetchedBuf.byteLength} bytes).`);
+    }
+    const detectedMime = detectImageMagic(fetchedBuf);
+    if (!detectedMime) {
+      throw new Error("Remote image URL did not return a valid PNG, JPEG, WebP, or GIF image.");
+    }
+    const dims = validateAndParseImageDimensions(fetchedBuf, "Remote input image");
+    return {
+      buffer: fetchedBuf,
+      mimeType: detectedMime,
+      dims,
+      finalUrl: currentUrl,
+      pinnedAddresses: resolved.addresses,
+    };
+  }
+  throw new Error(`Remote image URL exceeded maximum redirect limit (${maxRedirects}).`);
+}
+exports.fetchPinnedRemoteImageBytes = fetchPinnedRemoteImageBytes;
 
 function normalizeShadowOptions(additional = {}) {
   const rawShadowType =
@@ -743,6 +1068,7 @@ class RemoveAc {
           },
           options: [
             { name: "Full (Up to 25 MB / 50 MP)", value: "full" },
+            { name: "Maximum (Up to 25 MB / 50 MP)", value: "maximum" },
             { name: "Auto (Up to 50 MP)", value: "auto" },
             { name: "50 MP (Up to 50 MP)", value: "50mp" },
             { name: "25 MP (Up to 25 MP)", value: "25mp" },
@@ -769,6 +1095,7 @@ class RemoveAc {
             { name: "PNG (Transparent)", value: "png" },
             { name: "WebP", value: "webp" },
             { name: "JPG", value: "jpg" },
+            { name: "JPEG", value: "jpeg" },
             { name: "ZIP", value: "zip" },
           ],
           default: "png",
@@ -934,8 +1261,16 @@ class RemoveAc {
 
         const inputSource = this.getNodeParameter("inputSource", i, "binary");
         const outputBinaryPropertyName = this.getNodeParameter("outputBinaryPropertyName", i, "data");
-        const size = this.getNodeParameter("size", i, "full");
-        const format = this.getNodeParameter("format", i, "png");
+        const rawSize = this.getNodeParameter("size", i, "full");
+        const size = String(rawSize || "full").trim().toLowerCase();
+        if (!VALID_SIZE_SET.has(size)) {
+          throw new Error(`Unsupported size '${rawSize}'. Expected one of: ${VALID_SIZES.join(", ")}`);
+        }
+        const rawFormat = this.getNodeParameter("format", i, "png");
+        const format = String(rawFormat || "png").trim().toLowerCase();
+        if (!VALID_FORMAT_SET.has(format)) {
+          throw new Error(`Unsupported format '${rawFormat}'. Expected one of: ${VALID_FORMATS.join(", ")}`);
+        }
         const additional = this.getNodeParameter("additionalOptions", i, {}) || {};
         const channels = additional.channels || "rgba";
         const crop = Boolean(additional.crop);
@@ -984,6 +1319,7 @@ class RemoveAc {
         let sourceFileName = "image.png";
         let sourceMimeType = "image/png";
         let sourceUrl = null;
+        let initialResolvedSourceUrl = null;
         let fgDims = null;
 
         let effectiveInputSource = inputSource;
@@ -1034,90 +1370,34 @@ class RemoveAc {
         } else {
           const rawImageUrl =
             fallbackImageUrl || String(this.getNodeParameter("imageUrl", i, "") || "").trim();
-          const validated = await validatePublicUrl(rawImageUrl, {
+          initialResolvedSourceUrl = await resolveValidatedPublicUrl(rawImageUrl, {
             requireHttps: false,
+            allowTunFakeIp: false,
             lookupFn,
           });
-          sourceUrl = validated.toString();
-          const urlPath = validated.pathname.split("/").pop() || "remote-image";
+          sourceUrl = initialResolvedSourceUrl.url.toString();
+          const urlPath = initialResolvedSourceUrl.url.pathname.split("/").pop() || "remote-image";
           sourceFileName = urlPath;
         }
 
-        const fetchRemoteImageBytes = async (initialUrl) => {
-          let currentUrl = initialUrl;
-          for (let hop = 0; hop <= MAX_REMOTE_REDIRECTS; hop++) {
-            const validated = await validatePublicUrl(currentUrl, {
-              requireHttps: false,
-              lookupFn,
-            });
-            currentUrl = validated.toString();
+        const remoteTimeoutMs =
+          typeof this._remoteFetchTimeoutMsForTest === "number" && this._remoteFetchTimeoutMsForTest > 0
+            ? this._remoteFetchTimeoutMsForTest
+            : REMOTE_FETCH_TIMEOUT_MS;
+        const remoteTransportForTest =
+          typeof this._remoteHttpTransportForTest === "function"
+            ? this._remoteHttpTransportForTest
+            : null;
 
-            const imgRes = await this.helpers.httpRequest({
-              method: "GET",
-              url: currentUrl,
-              headers: {
-                Accept: "image/*,*/*;q=0.8",
-              },
-              encoding: "arraybuffer",
-              json: false,
-              disableFollowRedirect: true,
-              sendCredentialsOnCrossOriginRedirect: false,
-              returnFullResponse: true,
-              ignoreHttpStatusErrors: true,
-            });
-
-            const status =
-              imgRes && typeof imgRes.statusCode === "number" ? imgRes.statusCode : 200;
-            const rawBody =
-              imgRes && typeof imgRes === "object" && "statusCode" in imgRes
-                ? imgRes.body
-                : imgRes;
-            const respHeaders = (imgRes && imgRes.headers) || {};
-
-            if ([301, 302, 303, 307, 308].includes(status)) {
-              const location = readHeader(respHeaders, "location").trim();
-              if (!location) {
-                throw new Error(`Remote image redirect [HTTP ${status}] missing Location header.`);
-              }
-              if (hop === MAX_REMOTE_REDIRECTS) {
-                throw new Error(
-                  `Remote image URL exceeded maximum redirect limit (${MAX_REMOTE_REDIRECTS}).`
-                );
-              }
-              currentUrl = new URL(location, currentUrl).toString();
-              continue;
-            }
-
-            if (status < 200 || status >= 300) {
-              throw new Error(`Failed to fetch remote image [HTTP ${status}]`);
-            }
-
-            const fetchedBuf = toNodeBuffer(rawBody);
-            if (!fetchedBuf || fetchedBuf.byteLength === 0) {
-              throw new Error("Remote image response body is empty.");
-            }
-            if (fetchedBuf.byteLength > MAX_UPLOAD_BYTES) {
-              throw new Error(
-                `Remote image exceeds remove.ac 25 MB limit (${fetchedBuf.byteLength} bytes).`
-              );
-            }
-            const detectedMime = detectImageMagic(fetchedBuf);
-            if (!detectedMime) {
-              throw new Error(
-                "Remote image URL did not return a valid PNG, JPEG, WebP, or GIF image."
-              );
-            }
-            const dims = validateAndParseImageDimensions(fetchedBuf, "Remote input image");
-            return {
-              buffer: fetchedBuf,
-              mimeType: detectedMime,
-              dims,
-            };
-          }
-          throw new Error(
-            `Remote image URL exceeded maximum redirect limit (${MAX_REMOTE_REDIRECTS}).`
-          );
-        };
+        const fetchRemoteImageBytes = async (initialUrl) =>
+          fetchPinnedRemoteImageBytes(initialUrl, {
+            initialResolved: initialUrl === sourceUrl ? initialResolvedSourceUrl : null,
+            lookupFn,
+            maxBytes: MAX_UPLOAD_BYTES,
+            timeoutMs: remoteTimeoutMs,
+            maxRedirects: MAX_REMOTE_REDIRECTS,
+            transportForTest: remoteTransportForTest,
+          });
 
         const ensureSourceBytesForTicket = async () => {
           if (!sourceBytes) {
@@ -1171,7 +1451,7 @@ class RemoveAc {
           );
           if (mp.body.byteLength > MAX_DIRECT_BODY_BYTES) {
             throw new Error(
-              `Multipart direct upload payload (${mp.body.byteLength} bytes) exceeds remove.ac 32 MB stream limit.`
+              `Multipart direct upload payload (${mp.body.byteLength} bytes) exceeds remove.ac 30 MB stream limit.`
             );
           }
 
