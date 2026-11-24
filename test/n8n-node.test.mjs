@@ -5,13 +5,21 @@ import test from "node:test";
 const require = createRequire(import.meta.url);
 const { RemoveAcApi } = require("../dist/credentials/RemoveAcApi.credentials.js");
 const {
+  MAX_COMBINED_IMAGE_BYTES,
+  MAX_DIRECT_BODY_BYTES,
+  PACKAGE_VERSION,
   RemoveAc,
+  VALID_FORMATS,
+  VALID_SIZES,
   detectImageMagic,
+  fetchPinnedRemoteImageBytes,
   formatErrorBody,
   isAllowedDirectEndpointHost,
   normalizeShadowOptions,
   parseForegroundMetadata,
   parseImageDimensions,
+  requestPinnedRemoteHop,
+  resolveValidatedPublicUrl,
   toNodeBuffer,
   validateDirectEndpointUrl,
   validatePublicUrl,
@@ -31,10 +39,14 @@ function createMockExecuteContext({
   continueOnFail = false,
   allowLoopbackBaseUrlForTest = true,
   dnsLookupForTest = async () => [{ address: "93.184.216.34", family: 4 }],
+  useRealPinnedRemoteFetch = false,
+  remoteFetchTimeoutMsForTest,
 }) {
   return {
     _allowLoopbackBaseUrlForTest: allowLoopbackBaseUrlForTest,
     _dnsLookupForTest: dnsLookupForTest,
+    _remoteHttpTransportForTest: useRealPinnedRemoteFetch ? undefined : httpRequest,
+    _remoteFetchTimeoutMsForTest: remoteFetchTimeoutMsForTest,
     getInputData() {
       return items;
     },
@@ -529,7 +541,7 @@ test("R2 MF-1 (Probes 1, 2 & 7): releases ticket credit holds on 502/3xx/413/net
       throw new Error("must not touch network");
     },
   });
-  await assert.rejects(() => node.execute.call(combinedCtx), /32 MB direct upload stream limit/);
+  await assert.rejects(() => node.execute.call(combinedCtx), /29\.5 MB combined image limit/);
   assert.equal(combinedHttpCalls, 0);
 
   // 2. Live loopback Gateway + Worker + RedirectTarget verifying Probe 1 (502 -> release -> immediate retry succeeds with 1 credit) & Probe 7 (307 redirect no-leak + release)
@@ -1619,4 +1631,406 @@ test("M-P2-15 (P2-04): usableAsTool auto-falls back to URL mode when inputSource
   const readmePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "README.md");
   const readme = fs.readFileSync(readmePath, "utf8");
   assert.match(readme, /Input Source = Image URL/);
+});
+
+test("SEC-02 (v1.0.3): closes TOCTOU DNS-rebinding SSRF via zero-dep node:http/https custom lookup IP pinning", async () => {
+  const dns = await import("node:dns");
+  const http = await import("node:http");
+  const https = await import("node:https");
+  const { PassThrough } = await import("node:stream");
+  const node = new RemoveAc();
+
+  // 1. resolveValidatedPublicUrl unwraps public ::ffff:x.x.x.x to IPv4 and blocks private/metadata/198.18/trailing-dot/octal/6to4
+  const mappedPublic = await resolveValidatedPublicUrl("https://cdn.example.com/item.png", {
+    allowTunFakeIp: false,
+    lookupFn: async () => [{ address: "::ffff:93.184.216.34", family: 6 }],
+  });
+  assert.deepEqual(mappedPublic.addresses, [{ address: "93.184.216.34", family: 4 }]);
+
+  for (const badHostUrl of [
+    "http://localhost./secret.png",
+    "http://metadata.internal./secret.png",
+    "http://0177.0.0.1/secret.png",
+    "http://127.1/secret.png",
+    "http://[2002:7f00:0001::1]/secret.png",
+    "http://[2002:a9fe:a9fe::1]/secret.png",
+  ]) {
+    await assert.rejects(
+      () =>
+        resolveValidatedPublicUrl(badHostUrl, {
+          allowTunFakeIp: false,
+          lookupFn: async () => [{ address: "93.184.216.34", family: 4 }],
+        }),
+      /not permitted|Private, loopback/i,
+      `Expected rejection for ${badHostUrl}`
+    );
+  }
+
+  for (const badResolvedRecord of [
+    [{ address: "::ffff:169.254.169.254", family: 6 }],
+    [{ address: "::ffff:127.0.0.1", family: 6 }],
+    [{ address: "::ffff:198.18.0.12", family: 6 }],
+    [{ address: "198.18.0.12", family: 4 }],
+    [{ address: "100.64.0.10", family: 4 }],
+    [{ address: "10.0.0.5", family: 4 }],
+  ]) {
+    await assert.rejects(
+      () =>
+        resolveValidatedPublicUrl("https://remove.ac/untrusted-remote-image.png", {
+          allowTunFakeIp: false,
+          lookupFn: async () => badResolvedRecord,
+        }),
+      /private IPv[46] address/i
+    );
+  }
+
+  // 2. Real loopback TCP server: requestPinnedRemoteHop pins custom lookup IP with ZERO OS dns.lookup calls,
+  //    preserves Host header, hides 5xx body, enforces streaming maxBytes, and enforces hard timeout
+  const seenRemoteHeaders = [];
+  const srv = http.createServer((req, res) => {
+    seenRemoteHeaders.push({ url: req.url, headers: { ...req.headers } });
+    if (req.url === "/pinned.png") {
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(TINY_PNG);
+      return;
+    }
+    if (req.url === "/hop1.png") {
+      res.writeHead(302, { Location: "/pinned.png" });
+      res.end();
+      return;
+    }
+    if (req.url === "/err500") {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("SUPER_SECRET_ORIGIN_STACKTRACE");
+      return;
+    }
+    if (req.url === "/chunked-oversize") {
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.write(Buffer.alloc(1024, 0x41));
+      res.end(Buffer.alloc(1024, 0x42));
+      return;
+    }
+    if (req.url === "/hang") {
+      // Intentionally never respond to verify hard timeout
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const srvPort = srv.address().port;
+
+  const origDnsLookup = dns.default.lookup;
+  dns.default.lookup = () => {
+    throw new Error("OS dns.lookup MUST NOT be invoked by requestPinnedRemoteHop");
+  };
+  try {
+    const hopRes = await requestPinnedRemoteHop(
+      new URL(`http://rebind-proof.example:${srvPort}/pinned.png`),
+      [{ address: "127.0.0.1", family: 4 }],
+      { maxBytes: 4096, timeoutMs: 3000 }
+    );
+    assert.equal(hopRes.statusCode, 200);
+    assert.deepEqual(hopRes.body, TINY_PNG);
+    assert.equal(seenRemoteHeaders[0].headers.host, `rebind-proof.example:${srvPort}`);
+    assert.equal(seenRemoteHeaders[0].headers["user-agent"], `n8n-nodes-remove-ac/${PACKAGE_VERSION}`);
+    assert.equal(seenRemoteHeaders[0].headers["x-api-key"], undefined);
+    assert.equal(seenRemoteHeaders[0].headers.authorization, undefined);
+
+    await assert.rejects(
+      () =>
+        requestPinnedRemoteHop(
+          new URL(`http://rebind-proof.example:${srvPort}/err500`),
+          [{ address: "127.0.0.1", family: 4 }],
+          { maxBytes: 4096, timeoutMs: 3000 }
+        ),
+      (err) =>
+        err.message === "Failed to fetch remote image [HTTP 500]" &&
+        !err.message.includes("SUPER_SECRET_ORIGIN_STACKTRACE")
+    );
+
+    await assert.rejects(
+      () =>
+        requestPinnedRemoteHop(
+          new URL(`http://rebind-proof.example:${srvPort}/chunked-oversize`),
+          [{ address: "127.0.0.1", family: 4 }],
+          { maxBytes: 1500, timeoutMs: 3000 }
+        ),
+      /exceeds remove\.ac 25 MB limit/
+    );
+
+    await assert.rejects(
+      () =>
+        requestPinnedRemoteHop(
+          new URL(`http://rebind-proof.example:${srvPort}/hang`),
+          [{ address: "127.0.0.1", family: 4 }],
+          { maxBytes: 4096, timeoutMs: 80 }
+        ),
+      /Timed out fetching remote image/
+    );
+  } finally {
+    dns.default.lookup = origDnsLookup;
+    srv.close();
+  }
+
+  // 3. Production path (useRealPinnedRemoteFetch: true, _remoteHttpTransportForTest === undefined):
+  //    Verify single-resolution DNS pinning defeats TTL=0 TOCTOU DNS rebinding (93.184.216.34 -> 169.254.169.254),
+  //    preserves TLS SNI servername, NEVER calls helpers.httpRequest for remote image URLs, and blocks private redirect hops!
+  let rebindLookupCount = 0;
+  const statefulRebindLookup = async (host) => {
+    if (host === "ttl0-rebind.example.com") {
+      rebindLookupCount += 1;
+      if (rebindLookupCount === 1) {
+        return [{ address: "::ffff:93.184.216.34", family: 6 }];
+      }
+      // Attacker flips DNS to cloud metadata on 2nd lookup!
+      return [{ address: "169.254.169.254", family: 4 }];
+    }
+    if (host === "cdn-hop2.example.com") {
+      return [{ address: "198.51.100.99", family: 4 }]; // TEST-NET-2 reserved -> must be blocked!
+    }
+    if (host === "safe-hop2.example.com") {
+      return [{ address: "104.21.2.2", family: 4 }];
+    }
+    return [{ address: "93.184.216.34", family: 4 }];
+  };
+
+  const capturedHttpsReqs = [];
+  const origHttpsRequest = https.default.request;
+  https.default.request = (options, cb) => {
+    const pinnedFromLookup = [];
+    options.lookup(options.hostname, { all: true }, (_err, addrs) => {
+      pinnedFromLookup.push(...addrs);
+    });
+    let singleAddr = null;
+    options.lookup(options.hostname, { family: 4 }, (_err, addr, fam) => {
+      singleAddr = { address: addr, family: fam };
+    });
+    capturedHttpsReqs.push({
+      hostname: options.hostname,
+      servername: options.servername,
+      agent: options.agent,
+      headers: options.headers,
+      pinnedFromLookup,
+      singleAddr,
+      path: options.path,
+    });
+
+    const reqStream = new PassThrough();
+    reqStream.destroy = () => {};
+    process.nextTick(() => {
+      const resStream = new PassThrough();
+      resStream.destroy = () => {};
+      if (options.hostname === "ttl0-rebind.example.com" && options.path === "/redir-safe.png") {
+        resStream.statusCode = 302;
+        resStream.headers = { location: "https://safe-hop2.example.com/final.png" };
+        cb(resStream);
+        resStream.end();
+        return;
+      }
+      if (options.hostname === "ttl0-rebind.example.com" && options.path === "/redir-evil.png") {
+        resStream.statusCode = 302;
+        resStream.headers = { location: "https://cdn-hop2.example.com/evil.png" };
+        cb(resStream);
+        resStream.end();
+        return;
+      }
+      resStream.statusCode = 200;
+      resStream.headers = { "content-type": "image/png" };
+      cb(resStream);
+      resStream.end(makePngHeader(3000, 3000, 128));
+    });
+    return reqStream;
+  };
+
+  try {
+    const prodCtx = createMockExecuteContext({
+      items: [{ json: {} }],
+      useRealPinnedRemoteFetch: true,
+      dnsLookupForTest: statefulRebindLookup,
+      params: {
+        operation: "removeBackground",
+        inputSource: "url",
+        imageUrl: "https://ttl0-rebind.example.com/redir-safe.png",
+        outputBinaryPropertyName: "data",
+        size: "maximum",
+        format: "png",
+        additionalOptions: { direct: true },
+      },
+      httpRequest: async (opts) => {
+        // helpers.httpRequest MUST NEVER receive remote image host URLs!
+        assert.equal(opts.url.includes("example.com"), false, `Unexpected httpRequest to ${opts.url}`);
+        if (opts.url.endsWith("/v1.0/removebg/ticket")) {
+          return {
+            statusCode: 200,
+            body: {
+              data: {
+                ticket: "tkt_sec02",
+                directEndpoint: "http://127.0.0.1:9999/v1.0/direct-cutout",
+              },
+            },
+          };
+        }
+        return {
+          statusCode: 200,
+          headers: { "content-type": "image/png", "x-credits-charged": "1" },
+          body: TINY_PNG,
+        };
+      },
+    });
+
+    const [prodOut] = await node.execute.call(prodCtx);
+    assert.equal(prodOut[0].binary.data.fileName, "redir-safe-nobg.png");
+    assert.equal(rebindLookupCount, 1, "Initial hostname DNS must be resolved strictly ONCE (zero TOCTOU re-lookup)");
+    assert.equal(capturedHttpsReqs.length, 2);
+    // Hop 0 pinned unwrapped 93.184.216.34 (NEVER 169.254.169.254) with TLS SNI servername preserved & agent:false
+    assert.equal(capturedHttpsReqs[0].hostname, "ttl0-rebind.example.com");
+    assert.equal(capturedHttpsReqs[0].servername, "ttl0-rebind.example.com");
+    assert.equal(capturedHttpsReqs[0].agent, false);
+    assert.deepEqual(capturedHttpsReqs[0].pinnedFromLookup, [{ address: "93.184.216.34", family: 4 }]);
+    assert.deepEqual(capturedHttpsReqs[0].singleAddr, { address: "93.184.216.34", family: 4 });
+    // Hop 1 re-validated DNS and pinned safe-hop2's 104.21.2.2 with TLS SNI preserved
+    assert.equal(capturedHttpsReqs[1].hostname, "safe-hop2.example.com");
+    assert.equal(capturedHttpsReqs[1].servername, "safe-hop2.example.com");
+    assert.deepEqual(capturedHttpsReqs[1].singleAddr, { address: "104.21.2.2", family: 4 });
+
+    // Redirect hop resolving to disallowed IP (198.51.100.99) is blocked BEFORE opening hop-2 socket!
+    rebindLookupCount = 0;
+    capturedHttpsReqs.length = 0;
+    await assert.rejects(
+      () =>
+        fetchPinnedRemoteImageBytes("https://ttl0-rebind.example.com/redir-evil.png", {
+          lookupFn: statefulRebindLookup,
+        }),
+      /private IPv4 address/i
+    );
+    assert.equal(capturedHttpsReqs.length, 1, "Disallowed redirect hop must open 0 sockets to hop-2");
+  } finally {
+    https.default.request = origHttpsRequest;
+  }
+});
+
+test("ENG-02 (v1.0.3): supports size='maximum', format='jpeg', runtime enum guards, and exact 29.5 MiB / 30 MiB combined envelope", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  assert.equal(pkg.version, "1.0.3");
+  assert.equal(PACKAGE_VERSION, "1.0.3");
+  assert.equal(pkg.dependencies, undefined);
+
+  assert.equal(MAX_COMBINED_IMAGE_BYTES, 30_932_992);
+  assert.equal(MAX_DIRECT_BODY_BYTES, 30 * 1024 * 1024);
+  assert.ok(VALID_SIZES.includes("maximum"));
+  assert.ok(VALID_FORMATS.includes("jpeg"));
+
+  const node = new RemoveAc();
+  const sizeOptions = node.description.properties.find((p) => p.name === "size").options.map((o) => o.value);
+  const formatOptions = node.description.properties.find((p) => p.name === "format").options.map((o) => o.value);
+  assert.ok(sizeOptions.includes("maximum"));
+  assert.ok(formatOptions.includes("jpeg"));
+
+  // 1. Exact 29.5 MiB (15 MiB fg + 14.5 MiB bg = 30,932,992 B) with size="maximum" & format="jpeg" passes precheck and fits < 30 MiB
+  const fg15 = makePngHeader(2000, 2000, 15 * 1024 * 1024);
+  const bg14_5 = makePngHeader(2000, 2000, 14.5 * 1024 * 1024);
+  const bgOverBy1 = makePngHeader(2000, 2000, 14.5 * 1024 * 1024 + 1);
+
+  let seenTicketBody = null;
+  let seenMultipartLen = 0;
+  const okCtx = createMockExecuteContext({
+    items: [
+      {
+        json: {},
+        binary: {
+          data: { fileName: "hero.png", mimeType: "image/png" },
+          bg: { fileName: "backdrop.png", mimeType: "image/png" },
+        },
+      },
+    ],
+    binaryBuffers: { data: fg15, bg: bg14_5 },
+    params: {
+      operation: "removeBackground",
+      inputSource: "binary",
+      binaryPropertyName: "data",
+      outputBinaryPropertyName: "data",
+      size: "maximum",
+      format: "jpeg",
+      additionalOptions: { bgImageBinaryProperty: "bg" },
+    },
+    httpRequest: async (opts) => {
+      if (opts.url.endsWith("/v1.0/removebg/ticket")) {
+        seenTicketBody = opts.body;
+        return {
+          statusCode: 200,
+          body: {
+            data: {
+              ticket: "tkt_295",
+              directEndpoint: "http://127.0.0.1:9999/v1.0/direct-cutout",
+            },
+          },
+        };
+      }
+      seenMultipartLen = opts.body.byteLength;
+      return {
+        statusCode: 200,
+        headers: { "content-type": "image/jpeg", "x-credits-charged": "1" },
+        body: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+      };
+    },
+  });
+  const [okOut] = await node.execute.call(okCtx);
+  assert.equal(seenTicketBody.size, "maximum");
+  assert.equal(seenTicketBody.format, "jpeg");
+  assert.ok(seenMultipartLen > MAX_COMBINED_IMAGE_BYTES && seenMultipartLen < MAX_DIRECT_BODY_BYTES);
+  assert.equal(okOut[0].binary.data.fileName, "hero-nobg.jpg");
+  assert.equal(okOut[0].binary.data.mimeType, "image/jpeg");
+
+  // 2. 29.5 MiB + 1 B (30,932,993 B) and invalid size/format fail BEFORE any network call (0 HTTP calls)
+  let badHttpHits = 0;
+  for (const badCase of [
+    {
+      bins: { data: fg15, bg: bgOverBy1 },
+      params: {
+        operation: "removeBackground",
+        inputSource: "binary",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        size: "maximum",
+        format: "jpeg",
+        additionalOptions: { bgImageBinaryProperty: "bg" },
+      },
+      pattern: /29\.5 MB combined image limit/,
+    },
+    {
+      bins: { data: TINY_PNG, bg: TINY_PNG },
+      params: { operation: "removeBackground", inputSource: "binary", size: "999mp", format: "png" },
+      pattern: /Unsupported size/,
+    },
+    {
+      bins: { data: TINY_PNG, bg: TINY_PNG },
+      params: { operation: "removeBackground", inputSource: "binary", size: "maximum", format: "bmp" },
+      pattern: /Unsupported format/,
+    },
+  ]) {
+    const badCtx = createMockExecuteContext({
+      items: [
+        {
+          json: {},
+          binary: {
+            data: { fileName: "a.png", mimeType: "image/png" },
+            bg: { fileName: "b.png", mimeType: "image/png" },
+          },
+        },
+      ],
+      binaryBuffers: badCase.bins,
+      params: badCase.params,
+      httpRequest: async () => {
+        badHttpHits += 1;
+        throw new Error("should not touch network");
+      },
+    });
+    await assert.rejects(() => node.execute.call(badCtx), badCase.pattern);
+  }
+  assert.equal(badHttpHits, 0);
 });
